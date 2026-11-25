@@ -14,6 +14,7 @@ import BlameModal from "./components/inspector/BlameModal";
 import SettingsModal from "./components/settings/SettingsModal";
 import UpdatePrompt from "./components/layout/UpdatePrompt";
 import { EmptyState } from "./components/layout/Visuals";
+import logo from "./assets/logo.png";
 import ThreeWayResolver from "./components/merge/ThreeWayResolver";
 import InteractiveRebaseModal from "./components/merge/InteractiveRebaseModal";
 
@@ -131,11 +132,7 @@ function Welcome() {
     <div className="relative flex h-full flex-col items-center justify-center gap-7 overflow-auto bg-app px-6">
       <div className="pointer-events-none absolute inset-0" style={{ background: "radial-gradient(60% 50% at 50% 30%, rgb(var(--c-accent) / .13), transparent 70%)" }} />
       <div className="relative flex flex-col items-center gap-3 animate-pop-in">
-        <svg width="64" height="64" viewBox="0 0 64 64" fill="none" className="animate-float" aria-hidden>
-          <rect x="4" y="4" width="56" height="56" rx="16" style={{ fill: "rgb(var(--c-accent) / .12)", stroke: "rgb(var(--c-accent))" }} strokeWidth="2" />
-          <path d="M24 16v32M24 28c0 10 16 4 16 14" style={{ stroke: "rgb(var(--c-accent))" }} strokeWidth="3.5" strokeLinecap="round" />
-          <circle cx="24" cy="16" r="4.5" style={{ fill: "rgb(var(--c-accent))" }} /><circle cx="24" cy="48" r="4.5" style={{ fill: "rgb(var(--c-accent))" }} /><circle cx="40" cy="44" r="4.5" style={{ fill: "rgb(var(--c-accent-soft))" }} />
-        </svg>
+        <img src={logo} width={88} height={88} alt="" className="animate-float rounded-2xl" style={{ imageRendering: "pixelated" }} draggable={false} />
         <div className="text-4xl font-bold tracking-tight text-gray-50">Caesar<span className="text-amber">Git</span></div>
         <div className="text-sm text-gray-400">Un cliente Git rápido, claro y con buen gusto.</div>
       </div>
