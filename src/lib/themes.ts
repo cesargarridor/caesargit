@@ -21,9 +21,10 @@ export interface Theme {
 export const LANE_COUNT = 10;
 
 export const THEMES: Theme[] = [
-  { id: "gitkraken", name: "GitKraken Dark", dark: true, bg: "#1B1F27", panel: "#232933", elev: "#2B3240", line: "#343C4B", text: "#D9DEE7", accent: "#00C7A0",
-    git: ["#3FD17C", "#F5A524", "#F0556A", "#4DA3FF", "#FF5C8A"],
-    lanes: ["#00C7A0", "#4DA3FF", "#F5A524", "#B07CFF", "#FF5C8A", "#F0556A", "#3FD17C", "#FF8A3D", "#22D3EE", "#E5D04F"] },
+  { id: "gitkraken", name: "GitKraken Dark", dark: true, bg: "#1C1E23", panel: "#272A31", elev: "#32363F", line: "#383B41", text: "#C6C7C8", accent: "#4D88FF",
+    // Paleta oficial del tema «GitKraken Dark» (app__bg0, panel__bg0/1, graph-color-0..9, core colors).
+    git: ["#5CB85C", "#DE9B43", "#D9413D", "#4D88FF", "#C517B6"],
+    lanes: ["#15A0BF", "#0669F7", "#8E00C2", "#C517B6", "#D90171", "#CD0101", "#F25D2E", "#F2CA33", "#7BD938", "#2ECE9D"] },
   { id: "auto", name: "Automático (sistema)", dark: true, bg: "#0D0E11", panel: "#13151A", elev: "#1A1D24", line: "#262A34", text: "#E5E7EB", accent: "#F59E0B",
     git: ["#10B981", "#F59E0B", "#EF4444", "#3B82F6", "#F43F5E"], lanes: ["#F59E0B", "#38BDF8", "#10B981", "#A78BFA", "#FB7185", "#2DD4BF", "#FBBF24", "#818CF8"] },
   { id: "graphite", name: "Graphite & Amber", dark: true, bg: "#0D0E11", panel: "#13151A", elev: "#1A1D24", line: "#262A34", text: "#E5E7EB", accent: "#F59E0B",
