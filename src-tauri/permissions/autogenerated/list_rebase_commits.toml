@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-rebase-commits"
+description = "Enables the list_rebase_commits command without any pre-configured scope."
+commands.allow = ["list_rebase_commits"]
+
+[[permission]]
+identifier = "deny-list-rebase-commits"
+description = "Denies the list_rebase_commits command without any pre-configured scope."
+commands.deny = ["list_rebase_commits"]

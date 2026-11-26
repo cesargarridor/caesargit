@@ -4,3 +4,16 @@ src-tauri/target
 src-tauri/gen
 .DS_Store
 dist-mac
+
+# Secretos y claves: nunca al repo (scripts/release.mjs hace `git add -A`)
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.p8
+*.pfx
+*.cer
+*.mobileprovision
+.tauri/
+apple.env

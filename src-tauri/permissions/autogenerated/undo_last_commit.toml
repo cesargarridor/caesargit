@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-undo-last-commit"
+description = "Enables the undo_last_commit command without any pre-configured scope."
+commands.allow = ["undo_last_commit"]
+
+[[permission]]
+identifier = "deny-undo-last-commit"
+description = "Denies the undo_last_commit command without any pre-configured scope."
+commands.deny = ["undo_last_commit"]

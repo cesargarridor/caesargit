@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lfs-install"
+description = "Enables the lfs_install command without any pre-configured scope."
+commands.allow = ["lfs_install"]
+
+[[permission]]
+identifier = "deny-lfs-install"
+description = "Denies the lfs_install command without any pre-configured scope."
+commands.deny = ["lfs_install"]

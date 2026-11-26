@@ -117,7 +117,7 @@ export default function InteractiveRebaseModal({ baseSha, onClose }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-app animate-fade-in">
+    <div className="fixed inset-0 z-50 flex flex-col bg-app animate-fade-in pt-[var(--safe-top)]">
       <div className="flex items-center gap-3 border-b border-line bg-panel px-4 py-3">
         <span className="font-semibold text-amber">Interactive Rebase</span>
         <span className="flex-1 font-mono text-xs text-gray-500">sobre {baseSha.slice(0, 7)} · el primero se aplica antes (arriba = más antiguo)</span>

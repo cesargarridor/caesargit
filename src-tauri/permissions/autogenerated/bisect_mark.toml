@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-bisect-mark"
+description = "Enables the bisect_mark command without any pre-configured scope."
+commands.allow = ["bisect_mark"]
+
+[[permission]]
+identifier = "deny-bisect-mark"
+description = "Denies the bisect_mark command without any pre-configured scope."
+commands.deny = ["bisect_mark"]

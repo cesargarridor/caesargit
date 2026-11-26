@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-push-all-tags"
+description = "Enables the push_all_tags command without any pre-configured scope."
+commands.allow = ["push_all_tags"]
+
+[[permission]]
+identifier = "deny-push-all-tags"
+description = "Denies the push_all_tags command without any pre-configured scope."
+commands.deny = ["push_all_tags"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lfs-lock"
+description = "Enables the lfs_lock command without any pre-configured scope."
+commands.allow = ["lfs_lock"]
+
+[[permission]]
+identifier = "deny-lfs-lock"
+description = "Denies the lfs_lock command without any pre-configured scope."
+commands.deny = ["lfs_lock"]

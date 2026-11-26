@@ -4,6 +4,7 @@ import { GitBranch, Plus, X, FolderGit2 } from "lucide-react";
 import { useRepoStore } from "../../store/useRepoStore";
 import { usePrefs } from "../../store/usePrefs";
 import { ContextMenu, type CtxItem } from "./ContextMenu";
+const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
 
 export function RepoTabBar() {
   const tabs = useRepoStore((s) => s.tabs);
@@ -75,7 +76,7 @@ export function RepoTabBar() {
   };
 
   return (
-    <div className="flex h-[var(--h-tab)] shrink-0 items-end gap-0.5 border-b border-line bg-app px-2">
+    <div data-tauri-drag-region className={`flex h-[var(--h-tab)] shrink-0 items-end gap-0.5 border-b border-line bg-app pr-2 ${IS_MAC ? "pl-[80px]" : "pl-2"}`}>
       {tabs.map((t) => {
         const active = t.info.id === activeId && !newTabOpen;
         const dirty = (t.status?.files.length ?? 0) > 0;

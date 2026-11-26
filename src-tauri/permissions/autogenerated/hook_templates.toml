@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hook-templates"
+description = "Enables the hook_templates command without any pre-configured scope."
+commands.allow = ["hook_templates"]
+
+[[permission]]
+identifier = "deny-hook-templates"
+description = "Denies the hook_templates command without any pre-configured scope."
+commands.deny = ["hook_templates"]

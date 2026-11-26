@@ -286,7 +286,7 @@ export default function ThreeWayResolver({ path: initialPath, onClose }: Props) 
 
   const btn = "rounded border border-line px-2 py-0.5 text-xs text-gray-200 hover:border-amber hover:text-amber disabled:opacity-40";
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-app">
+    <div className="fixed inset-0 z-50 flex flex-col bg-app pt-[var(--safe-top)]">
       <OperationBanner />
       <div className="flex items-center gap-2 border-b border-line bg-panel px-3 py-2 text-sm">
         <span className="font-semibold text-amber">Resolver conflicto</span>

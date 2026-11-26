@@ -46,10 +46,17 @@ fn validate_external_path(p: &str) -> Result<PathBuf> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(AppError::invalid_path("la ruta contiene '..'"));
     }
-    if path.components().any(|c| matches!(c, Component::Normal(n) if n.to_string_lossy().eq_ignore_ascii_case(".git"))) {
+    let dot_git = |p: &Path| p.components().any(|c| matches!(c, Component::Normal(n) if n.to_string_lossy().eq_ignore_ascii_case(".git")));
+    if dot_git(path) {
         return Err(AppError::invalid_path("la ruta no puede pasar por un directorio .git"));
     }
-    Ok(path.to_path_buf())
+    // Canoniza el ancestro existente (resuelve symlinks) y vuelve a comprobar `.git`: un symlink
+    // de una carpeta del usuario hacia `.git/hooks` ya no pasa (auditoría B-07).
+    let canon = canonicalize_lenient(path)?;
+    if dot_git(&canon) {
+        return Err(AppError::invalid_path("la ruta no puede pasar por un directorio .git"));
+    }
+    Ok(canon)
 }
 
 // ================================================================ (1) Reflog
@@ -195,7 +202,7 @@ pub async fn bisect_status(repo_path: String) -> Result<BisectStatus> {
 pub async fn create_patch(repo_path: String, shas: Option<Vec<String>>, wip: Option<bool>) -> Result<String> {
     let r = root(&repo_path).await?;
     let text = if wip.unwrap_or(false) {
-        let mut args = vec!["diff", "--binary", "--no-color"];
+        let mut args = vec!["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv"];
         if has_head(&r).await {
             args.push("HEAD");
         } else {
@@ -211,7 +218,7 @@ pub async fn create_patch(repo_path: String, shas: Option<Vec<String>>, wip: Opt
         let mut acc = String::new();
         for s in &shas {
             validate_sha(s)?;
-            acc.push_str(&executor::read(&r, &["format-patch", "--stdout", "--no-signature", "-1", s.as_str()]).await?);
+            acc.push_str(&executor::read(&r, &["format-patch", "--stdout", "--no-signature", "--no-ext-diff", "--no-textconv", "-1", s.as_str()]).await?);
         }
         acc
     };
@@ -1172,10 +1179,47 @@ fn check_hook_name(name: &str) -> Result<&str> {
     }
 }
 
+/// Canoniza `p` aunque no exista: resuelve el ancestro existente más profundo y reañade el resto.
+fn canonicalize_lenient(p: &Path) -> Result<PathBuf> {
+    let mut existing = p;
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let base = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(c) => break c,
+            Err(_) => {
+                rest.push(existing.file_name().ok_or_else(|| AppError::invalid_path("ruta no válida"))?);
+                existing = existing.parent().ok_or_else(|| AppError::invalid_path("ruta no válida"))?;
+            }
+        }
+    };
+    Ok(rest.iter().rev().fold(base, |mut acc, n| {
+        acc.push(n);
+        acc
+    }))
+}
+
+/// Carpeta de hooks. Debe quedar dentro del directorio git del repo: con `core.hooksPath` (config
+/// del repo, no confiable) apuntando fuera, editar hooks crearía/borraría archivos arbitrarios
+/// (auditoría B-02).
 async fn hooks_dir(root: &Path) -> Result<PathBuf> {
     let out = executor::read(root, &["rev-parse", "--git-path", "hooks"]).await?;
     let p = PathBuf::from(out.trim_end_matches(['\n', '\r']));
-    Ok(if p.is_absolute() { p } else { root.join(p) })
+    let p = if p.is_absolute() { p } else { root.join(p) };
+    let common = executor::read(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await?;
+    let common = std::fs::canonicalize(common.trim_end_matches(['\n', '\r']))?;
+    let canon = canonicalize_lenient(&p)?;
+    if !canon.starts_with(&common) {
+        return Err(AppError::invalid_path("core.hooksPath apunta fuera de .git: los hooks no se pueden editar desde aquí"));
+    }
+    Ok(canon)
+}
+
+/// Un hook nunca puede ser un symlink (las escrituras lo seguirían hacia fuera de .git).
+fn reject_symlink(p: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(AppError::invalid_path("el hook es un enlace simbólico: no se modifica"));
+    }
+    Ok(())
 }
 
 fn is_exec(p: &Path) -> bool {
@@ -1237,6 +1281,7 @@ pub async fn read_hook(repo_path: String, name: String) -> Result<String> {
     let dir = hooks_dir(&r).await?;
     for suf in ["", ".disabled", ".sample"] {
         let p = suffixed(&dir, &name, suf);
+        reject_symlink(&p)?;
         if p.is_file() {
             return Ok(String::from_utf8_lossy(&tokio::fs::read(&p).await?).into_owned());
         }
@@ -1256,6 +1301,8 @@ pub async fn write_hook(repo_path: String, name: String, content: String) -> Res
     tokio::fs::create_dir_all(&dir).await?;
     let real = dir.join(&name);
     let dis = suffixed(&dir, &name, ".disabled");
+    reject_symlink(&real)?;
+    reject_symlink(&dis)?;
     let target = if !real.exists() && dis.is_file() { dis } else { real };
     tokio::fs::write(&target, content.replace("\r\n", "\n")).await?;
     make_exec(&target)?;
@@ -1270,6 +1317,9 @@ pub async fn toggle_hook(repo_path: String, name: String, enabled: bool) -> Resu
     let real = dir.join(&name);
     let dis = suffixed(&dir, &name, ".disabled");
     let sample = suffixed(&dir, &name, ".sample");
+    for p in [&real, &dis, &sample] {
+        reject_symlink(p)?;
+    }
     if enabled {
         if real.is_file() {
             make_exec(&real)?;
@@ -1301,6 +1351,7 @@ pub async fn delete_hook(repo_path: String, name: String) -> Result<()> {
     let mut any = false;
     for suf in ["", ".disabled"] {
         let p = suffixed(&dir, &name, suf);
+        reject_symlink(&p)?;
         if p.is_file() {
             tokio::fs::remove_file(&p).await?;
             any = true;
@@ -2085,5 +2136,60 @@ mod tests {
         assert!(sh(d, &["branch", "--list", "feature/u"]).is_empty());
         redo_action(p.clone()).await.unwrap();
         assert_eq!(sh(d, &["branch", "--show-current"]), "feature/u");
+    }
+
+    /// B-02: con `core.hooksPath` fuera de .git no se crean, leen ni borran hooks.
+    #[tokio::test]
+    async fn b02_hooks_path_fuera_de_git_rechazado() {
+        let (td, p) = init();
+        let d = td.path();
+        let outside = tempfile::tempdir().unwrap();
+        sh(d, &["config", "core.hooksPath", outside.path().to_str().unwrap()]);
+        std::fs::write(outside.path().join("pre-commit"), "#!/bin/sh\necho ajeno\n").unwrap();
+        assert!(write_hook(p.clone(), "pre-commit".into(), "#!/bin/sh\ntouch x\n".into()).await.is_err());
+        assert!(read_hook(p.clone(), "pre-commit".into()).await.is_err());
+        assert!(toggle_hook(p.clone(), "pre-commit".into(), false).await.is_err());
+        assert!(delete_hook(p.clone(), "pre-commit".into()).await.is_err());
+        assert_eq!(std::fs::read_to_string(outside.path().join("pre-commit")).unwrap(), "#!/bin/sh\necho ajeno\n");
+        assert!(!outside.path().join("pre-commit.disabled").exists());
+    }
+
+    /// B-02: un hook que es symlink no se sobrescribe hacia fuera de .git.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn b02_hook_symlink_no_se_sigue() {
+        let (td, p) = init();
+        let d = td.path();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victima");
+        std::fs::write(&victim, "intacto").unwrap();
+        std::os::unix::fs::symlink(&victim, d.join(".git/hooks/pre-commit")).unwrap();
+        assert!(write_hook(p.clone(), "pre-commit".into(), "#!/bin/sh\ntouch x\n".into()).await.is_err());
+        assert!(read_hook(p.clone(), "pre-commit".into()).await.is_err());
+        assert!(toggle_hook(p.clone(), "pre-commit".into(), false).await.is_err());
+        assert!(delete_hook(p.clone(), "pre-commit".into()).await.is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "intacto");
+        // el caso normal sigue funcionando
+        std::fs::remove_file(d.join(".git/hooks/pre-commit")).unwrap();
+        write_hook(p.clone(), "pre-commit".into(), "#!/bin/sh\nexit 0\n".into()).await.unwrap();
+        assert!(read_hook(p, "pre-commit".into()).await.unwrap().contains("exit 0"));
+    }
+
+    /// B-07: la ruta externa se canoniza y un symlink hacia `.git` no la esquiva.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn b07_ruta_externa_canonizada() {
+        let (td, p) = init();
+        let d = td.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(d.join(".git/hooks"), outside.path().join("h")).unwrap();
+        let bad = outside.path().join("h/evil.patch");
+        assert!(validate_external_path(bad.to_str().unwrap()).is_err());
+        assert!(save_patch(bad.to_str().unwrap().into(), "x".into()).await.is_err());
+        assert!(!d.join(".git/hooks/evil.patch").exists());
+        let ok = outside.path().join("bien.patch");
+        save_patch(ok.to_str().unwrap().into(), "x".into()).await.unwrap();
+        assert!(ok.exists());
+        let _ = p;
     }
 }

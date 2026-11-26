@@ -48,6 +48,7 @@ pub fn run() {
             git::ext_a::run_difftool,
             git::ext_a::run_mergetool,
             git::ext_a::get_activity_log,
+            git::ext_a::check_git_version,
             git::ext_a::compare_refs,
             git::ext_a::compare_file_diff,
             git::ext_a::is_ancestor,

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fixup-commit"
+description = "Enables the fixup_commit command without any pre-configured scope."
+commands.allow = ["fixup_commit"]
+
+[[permission]]
+identifier = "deny-fixup-commit"
+description = "Denies the fixup_commit command without any pre-configured scope."
+commands.deny = ["fixup_commit"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unset-upstream"
+description = "Enables the unset_upstream command without any pre-configured scope."
+commands.allow = ["unset_upstream"]
+
+[[permission]]
+identifier = "deny-unset-upstream"
+description = "Denies the unset_upstream command without any pre-configured scope."
+commands.deny = ["unset_upstream"]

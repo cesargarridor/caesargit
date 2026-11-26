@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-submodule-remove"
+description = "Enables the submodule_remove command without any pre-configured scope."
+commands.allow = ["submodule_remove"]
+
+[[permission]]
+identifier = "deny-submodule-remove"
+description = "Denies the submodule_remove command without any pre-configured scope."
+commands.deny = ["submodule_remove"]

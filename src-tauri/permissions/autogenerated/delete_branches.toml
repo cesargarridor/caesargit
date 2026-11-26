@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-branches"
+description = "Enables the delete_branches command without any pre-configured scope."
+commands.allow = ["delete_branches"]
+
+[[permission]]
+identifier = "deny-delete-branches"
+description = "Denies the delete_branches command without any pre-configured scope."
+commands.deny = ["delete_branches"]

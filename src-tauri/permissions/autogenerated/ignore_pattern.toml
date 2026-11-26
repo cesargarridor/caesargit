@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ignore-pattern"
+description = "Enables the ignore_pattern command without any pre-configured scope."
+commands.allow = ["ignore_pattern"]
+
+[[permission]]
+identifier = "deny-ignore-pattern"
+description = "Denies the ignore_pattern command without any pre-configured scope."
+commands.deny = ["ignore_pattern"]

@@ -9,7 +9,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   gate:
@@ -30,22 +30,28 @@ jobs:
   prepare:
     needs: gate
     if: needs.gate.outputs.go == 'true'
+    permissions:
+      contents: write
     runs-on: ubuntu-22.04
     outputs:
       id: ${{ steps.r.outputs.id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - id: r
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
           f="release-notes/$TAG.md"
           [ -f "$f" ] || { mkdir -p release-notes; echo "- Mejoras y correcciones." > "$f"; }
-          id=$(gh api "repos/${{ github.repository }}/releases" --jq ".[] | select(.tag_name==\"$TAG\") | .id" | head -1)
+          id=$(gh api "repos/$REPO/releases" --jq ".[] | select(.tag_name==\"$TAG\") | .id" | head -1)
           if [ -z "$id" ]; then
-            id=$(gh api -X POST "repos/${{ github.repository }}/releases" \
-              -f tag_name="$TAG" -f target_commitish="${{ github.sha }}" -f name="CaesarGit $TAG" -F body=@"$f" -F draft=true -F prerelease=false --jq .id)
+            id=$(gh api -X POST "repos/$REPO/releases" \
+              -f tag_name="$TAG" -f target_commitish="$SHA" -f name="CaesarGit $TAG" -F body=@"$f" -F draft=true -F prerelease=false --jq .id)
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
@@ -60,9 +66,13 @@ jobs:
             args: ""
           - os: ubuntu-22.04
             args: "--bundles deb,appimage"
+    permissions:
+      contents: write
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Dependencias de Linux (Tauri v2)
         if: matrix.os == 'ubuntu-22.04'
@@ -73,14 +83,14 @@ jobs:
             libayatana-appindicator3-dev libssl-dev \
             build-essential pkg-config file patchelf
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri
 
@@ -89,11 +99,13 @@ jobs:
       - name: Notas de la versión
         id: notes
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          f="release-notes/${{ github.ref_name }}.md"
+          f="release-notes/$TAG.md"
           { echo "body<<NOTES_EOF"; if [ -f "$f" ]; then cat "$f"; else echo "- Mejoras y correcciones."; fi; echo "NOTES_EOF"; } >> "$GITHUB_OUTPUT"
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -112,14 +124,18 @@ jobs:
   publish:
     needs: [gate, release]
     if: needs.gate.outputs.go == 'true'
+    permissions:
+      contents: write
     runs-on: ubuntu-22.04
     steps:
       - name: Publicar la Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
-          tag="${{ github.ref_name }}"
-          repo="${{ github.repository }}"
+          tag="$TAG"
+          repo="$REPO"
           # macOS: lo compila el dueño en su Mac (node scripts/mac-build.mjs) y sube el .dmg, el .app.tar.gz(+.sig) y
           # mac-platforms.json. Aquí se espera a ese archivo (hasta 3 h) y se fusiona en latest.json.
           ok=""

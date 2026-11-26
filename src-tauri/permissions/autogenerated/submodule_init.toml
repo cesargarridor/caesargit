@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-submodule-init"
+description = "Enables the submodule_init command without any pre-configured scope."
+commands.allow = ["submodule_init"]
+
+[[permission]]
+identifier = "deny-submodule-init"
+description = "Denies the submodule_init command without any pre-configured scope."
+commands.deny = ["submodule_init"]

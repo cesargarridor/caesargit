@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-push-tag"
+description = "Enables the push_tag command without any pre-configured scope."
+commands.allow = ["push_tag"]
+
+[[permission]]
+identifier = "deny-push-tag"
+description = "Denies the push_tag command without any pre-configured scope."
+commands.deny = ["push_tag"]
