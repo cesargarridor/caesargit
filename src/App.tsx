@@ -1,22 +1,42 @@
-import { useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
-import { AlertTriangle, FolderOpen, GitBranch, X } from "lucide-react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { AlertTriangle, X } from "lucide-react";
 import { useRepoStore, type DialogField, type DialogState } from "./store/useRepoStore";
+import { usePrefs } from "./store/usePrefs";
 import { useGitEvents } from "./hooks/useGitEvents";
 import { RepoTabBar } from "./components/layout/RepoTabBar";
 import { ActionToolbar } from "./components/layout/ActionToolbar";
 import { Sidebar } from "./components/layout/Sidebar";
+import { StatusBar } from "./components/layout/StatusBar";
+import { NewTabView } from "./components/layout/NewTabView";
 import { CommandPalette } from "./components/layout/CommandPalette";
 import { CommitGraph } from "./components/graph/CommitGraph";
 import WipPanel from "./components/inspector/WipPanel";
 import CommitDetail from "./components/inspector/CommitDetail";
 import BlameModal from "./components/inspector/BlameModal";
-import SettingsModal from "./components/settings/SettingsModal";
 import UpdatePrompt from "./components/layout/UpdatePrompt";
 import { EmptyState } from "./components/layout/Visuals";
-import logo from "./assets/logo.png";
 import ThreeWayResolver from "./components/merge/ThreeWayResolver";
 import InteractiveRebaseModal from "./components/merge/InteractiveRebaseModal";
+import BisectBanner, { BISECT_CHANGED_EVENT } from "./components/tools/BisectBanner";
+
+// Modales pesados: carga diferida
+const CloneModal = lazy(() => import("./components/tools/CloneModal"));
+const InitModal = lazy(() => import("./components/tools/InitModal"));
+const RemotesModal = lazy(() => import("./components/tools/RemotesModal"));
+const ReflogModal = lazy(() => import("./components/tools/ReflogModal"));
+const PatchModal = lazy(() => import("./components/tools/PatchModal"));
+const CompareView = lazy(() => import("./components/tools/CompareView"));
+const SubmodulesModal = lazy(() => import("./components/tools/SubmodulesModal"));
+const WorktreesModal = lazy(() => import("./components/tools/WorktreesModal"));
+const LfsModal = lazy(() => import("./components/tools/LfsModal"));
+const GitflowModal = lazy(() => import("./components/tools/GitflowModal"));
+const HooksModal = lazy(() => import("./components/tools/HooksModal"));
+const ActivityLogModal = lazy(() => import("./components/tools/ActivityLogModal"));
+const ShortcutsModal = lazy(() => import("./components/tools/ShortcutsModal"));
+const PreferencesModal = lazy(() => import("./components/settings/PreferencesModal"));
+const RepoSettingsModal = lazy(() => import("./components/tools/RepoSettingsModal"));
 
 const handleV = "w-px bg-line transition-colors hover:bg-amber data-[resize-handle-state=drag]:bg-amber";
 
@@ -124,41 +144,28 @@ function OperationBanner() {
   );
 }
 
-function Welcome() {
-  const recents = useRepoStore((s) => s.recents);
-  const { pickAndOpen, openRepo } = useRepoStore.getState();
-  const base = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
-  return (
-    <div className="relative flex h-full flex-col items-center justify-center gap-7 overflow-auto bg-app px-6">
-      <div className="pointer-events-none absolute inset-0" style={{ background: "radial-gradient(60% 50% at 50% 30%, rgb(var(--c-accent) / .13), transparent 70%)" }} />
-      <div className="relative flex flex-col items-center gap-3 animate-pop-in">
-        <img src={logo} width={88} height={88} alt="" className="animate-float rounded-2xl" style={{ imageRendering: "pixelated" }} draggable={false} />
-        <div className="text-4xl font-bold tracking-tight text-gray-50">Caesar<span className="text-amber">Git</span></div>
-        <div className="text-sm text-gray-400">Un cliente Git rápido, claro y con buen gusto.</div>
-      </div>
-      <button className="relative flex items-center gap-2 rounded-lg bg-amber px-5 py-2.5 text-sm font-semibold text-onacc shadow-glow transition hover:-translate-y-0.5 hover:bg-amber-hover"
-        onClick={() => void pickAndOpen()}><FolderOpen size={16} /> Abrir repositorio <kbd className="font-mono text-[10px] opacity-70">⌘O</kbd></button>
-      <div className="relative w-[520px] max-w-full">
-        <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-gray-500">Recientes</div>
-        {recents.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-line px-4 py-6 text-center text-xs text-gray-500">Aún no has abierto ningún repositorio.</div>
-        ) : (
-          <div className="space-y-1.5">
-            {recents.slice(0, 6).map((p) => (
-              <button key={p} className="group flex w-full items-center gap-3 rounded-lg border border-line bg-panel px-3 py-2 text-left transition hover:-translate-y-px hover:border-amber/50 hover:bg-elev"
-                onClick={() => void openRepo(p)}>
-                <GitBranch size={15} className="shrink-0 text-gray-500 group-hover:text-amber" />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-medium text-gray-100">{base(p)}</span>
-                  <span className="block truncate font-mono text-[11px] text-gray-500">{p}</span>
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
+/** Modal {kind:"bisect"}: pide los commits bad/good, arranca el bisect y deja el banner activo. */
+function BisectStarter({ onClose }: { onClose: () => void }) {
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const st = useRepoStore.getState();
+      const head = st.activeTab()?.status?.headSha ?? "HEAD";
+      const r = await st.ask({
+        title: "Iniciar bisect", message: "Indica un commit malo y uno bueno (SHA, rama o tag). Git irá proponiendo commits intermedios.",
+        fields: [{ key: "bad", label: "Commit malo", initial: head === "HEAD" ? "HEAD" : head.slice(0, 12) }, { key: "good", label: "Commit bueno" }],
+        confirmLabel: "Empezar",
+      });
+      if (r && alive) {
+        const res = await st.act("bisect_start", { bad: r.bad.trim(), good: r.good.trim() });
+        if (res !== undefined) window.dispatchEvent(new CustomEvent(BISECT_CHANGED_EVENT));
+      }
+      if (alive) onClose();
+    })();
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return null;
 }
 
 function Inspector() {
@@ -168,35 +175,86 @@ function Inspector() {
   return <div className="h-full bg-panel"><EmptyState art="select" title="Selecciona un commit" hint="Elige un commit del grafo o el nodo WIP para ver sus cambios." /></div>;
 }
 
+function Modals() {
+  const modal = useRepoStore((s) => s.modal);
+  const setModal = useRepoStore((s) => s.setModal);
+  const close = () => setModal(null);
+  if (!modal) return null;
+  return (
+    <Suspense fallback={null}>
+      {modal.kind === "blame" && <BlameModal path={modal.path} rev={modal.rev} onClose={close} />}
+      {modal.kind === "conflict" && <ThreeWayResolver path={modal.path} onClose={close} />}
+      {modal.kind === "rebase" && <InteractiveRebaseModal baseSha={modal.baseSha} onClose={close} />}
+      {modal.kind === "clone" && <CloneModal onClose={close} />}
+      {modal.kind === "init" && <InitModal onClose={close} />}
+      {modal.kind === "remotes" && <RemotesModal onClose={close} />}
+      {modal.kind === "reflog" && <ReflogModal onClose={close} />}
+      {modal.kind === "patch" && <PatchModal sha={modal.sha} onClose={close} />}
+      {modal.kind === "compare" && <CompareView a={modal.a} b={modal.b} onClose={close} />}
+      {modal.kind === "submodules" && <SubmodulesModal onClose={close} />}
+      {modal.kind === "worktrees" && <WorktreesModal onClose={close} />}
+      {modal.kind === "lfs" && <LfsModal onClose={close} />}
+      {modal.kind === "gitflow" && <GitflowModal onClose={close} />}
+      {modal.kind === "hooks" && <HooksModal onClose={close} />}
+      {modal.kind === "activity" && <ActivityLogModal onClose={close} />}
+      {modal.kind === "shortcuts" && <ShortcutsModal onClose={close} />}
+      {modal.kind === "preferences" && <PreferencesModal onClose={close} />}
+      {modal.kind === "repoSettings" && <RepoSettingsModal onClose={close} />}
+      {modal.kind === "bisect" && <BisectStarter onClose={close} />}
+    </Suspense>
+  );
+}
+
 export default function App() {
   useGitEvents();
   const tab = useRepoStore((s) => s.tabs.find((t) => t.info.id === s.activeId) ?? null);
-  const modal = useRepoStore((s) => s.modal);
-  const setModal = useRepoStore((s) => s.setModal);
+  const newTabOpen = useRepoStore((s) => s.newTabOpen);
+  const zoom = usePrefs((s) => s.zoom);
+  const globalLeft = usePrefs((s) => s.showLeftPanel);
+  const globalRight = usePrefs((s) => s.showRightPanel);
+  const showLeft = tab?.repoPrefs.showLeftPanel ?? globalLeft;
+  const showRight = tab?.repoPrefs.showRightPanel ?? globalRight;
 
+  // zoom de la interfaz (80-300 %) con el zoom nativo del webview: mantiene bien las coordenadas de menús y popovers
+  useEffect(() => {
+    void getCurrentWebview().setZoom(zoom / 100).catch(() => undefined);
+  }, [zoom]);
+
+  const showMain = !!tab && !newTabOpen;
   return (
     <div className="flex h-full flex-col bg-app text-gray-200">
       <RepoTabBar />
-      <ActionToolbar />
-      <OperationBanner />
+      {showMain && <ActionToolbar />}
+      {showMain && <OperationBanner />}
+      {showMain && <BisectBanner />}
       <div className="min-h-0 flex-1">
-        {!tab ? <Welcome /> : (
-          <PanelGroup direction="horizontal" autoSaveId="caesargit-main">
-            <Panel defaultSize={18} minSize={12} maxSize={35} className="bg-panel"><Sidebar /></Panel>
-            <PanelResizeHandle className={handleV} />
-            <Panel defaultSize={52} minSize={30} className="relative">
+        {!showMain ? <NewTabView /> : (
+          <PanelGroup direction="horizontal" autoSaveId="caesargit-main" key={`${showLeft}-${showRight}`}>
+            {showLeft && (
+              <>
+                <Panel id="left" order={1} defaultSize={18} minSize={12} maxSize={35} className="bg-panel">
+                  <div data-pane="sidebar" tabIndex={-1} className="h-full outline-none"><Sidebar /></div>
+                </Panel>
+                <PanelResizeHandle className={handleV} />
+              </>
+            )}
+            <Panel id="center" order={2} defaultSize={52} minSize={30} className="relative">
               <CommitGraph />
             </Panel>
-            <PanelResizeHandle className={handleV} />
-            <Panel defaultSize={30} minSize={20} maxSize={55} className="bg-panel"><Inspector /></Panel>
+            {showRight && (
+              <>
+                <PanelResizeHandle className={handleV} />
+                <Panel id="right" order={3} defaultSize={30} minSize={20} maxSize={55} className="bg-panel">
+                  <div data-pane="inspector" tabIndex={-1} className="h-full outline-none"><Inspector /></div>
+                </Panel>
+              </>
+            )}
           </PanelGroup>
         )}
       </div>
-      {modal?.kind === "blame" && <BlameModal path={modal.path} rev={modal.rev} onClose={() => setModal(null)} />}
-      {modal?.kind === "conflict" && <ThreeWayResolver path={modal.path} onClose={() => setModal(null)} />}
-      {modal?.kind === "rebase" && <InteractiveRebaseModal baseSha={modal.baseSha} onClose={() => setModal(null)} />}
+      <StatusBar />
+      <Modals />
       <CommandPalette />
-      <SettingsModal />
       <UpdatePrompt />
       <DialogHost />
       <Toasts />

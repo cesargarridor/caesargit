@@ -1,7 +1,8 @@
 import { DiffSkeleton } from "../layout/Visuals";
 import { laneVar } from "../../lib/themes";
 import { useEffect, useState } from "react";
-import { X } from "lucide-react";
+import { History, X } from "lucide-react";
+import { FileHistoryModal } from "./FileHistoryModal";
 import { useRepoStore } from "../../store/useRepoStore";
 import type { BlameLine } from "../../types/git";
 
@@ -12,7 +13,10 @@ interface Props {
 }
 
 
-export default function BlameModal({ path, rev, onClose }: Props) {
+export default function BlameModal({ path: initialPath, rev, onClose }: Props) {
+  const [path, setPath] = useState(initialPath);
+  const [pathInput, setPathInput] = useState(initialPath);
+  const [history, setHistory] = useState(false);
   const run = useRepoStore((s) => s.run);
   const setModal = useRepoStore((s) => s.setModal);
   const setSelection = useRepoStore((s) => s.setSelection);
@@ -29,7 +33,7 @@ export default function BlameModal({ path, rev, onClose }: Props) {
   }, [path, rev, run]);
 
   useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === "Escape") close(); };
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape" && !history && !(e.target as HTMLElement | null)?.closest?.("input")) close(); };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   });
@@ -41,13 +45,20 @@ export default function BlameModal({ path, rev, onClose }: Props) {
   };
 
   return (
+    <>
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-scrim/60 animate-fade-in" onMouseDown={close}>
       <div className="flex h-[80vh] w-[min(1100px,92vw)] flex-col rounded-lg border border-line bg-elev shadow-2xl animate-pop-in" onMouseDown={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2 border-b border-line px-3 py-2 text-sm">
           <span className="font-semibold text-amber">Blame</span>
-          <span className="min-w-0 flex-1 truncate font-mono text-xs text-gray-300" title={path}>
-            {path}{rev ? ` @ ${rev.slice(0, 7)}` : ""}
-          </span>
+          <input
+            value={pathInput}
+            onChange={(e) => setPathInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && pathInput.trim()) setPath(pathInput.trim()); }}
+            title="Escribe otra ruta y pulsa Enter para cambiar de archivo"
+            className="min-w-0 flex-1 rounded border border-transparent bg-transparent px-1 font-mono text-xs text-gray-300 outline-none focus:border-amber"
+          />
+          {rev && <span className="font-mono text-xs text-gray-500">@ {rev.slice(0, 7)}</span>}
+          <button onClick={() => setHistory(true)} title="File History" className="flex items-center gap-1 text-xs text-gray-400 hover:text-amber"><History size={13} /> History</button>
           <button onClick={close} className="text-gray-400 hover:text-amber"><X size={15} /></button>
         </div>
         <div className="min-h-0 flex-1 overflow-auto bg-app font-mono text-xs">
@@ -80,5 +91,7 @@ export default function BlameModal({ path, rev, onClose }: Props) {
         </div>
       </div>
     </div>
+    {history && <FileHistoryModal path={path} onClose={() => setHistory(false)} />}
+    </>
   );
 }

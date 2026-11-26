@@ -3,5 +3,7 @@
   "identifier": "default",
   "description": "Permisos minimos de la ventana principal",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": ["core:default", "dialog:allow-open",
+    "dialog:allow-save",
+    "core:webview:allow-set-webview-zoom"]
 }

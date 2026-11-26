@@ -85,7 +85,7 @@ mod tests {
     use crate::git::models::DiffLine;
 
     fn l(kind: &str, c: &str) -> DiffLine {
-        DiffLine { kind: kind.into(), content: c.into(), old_no: None, new_no: None }
+        DiffLine { kind: kind.into(), content: c.into(), old_no: None, new_no: None, words: None }
     }
 
     fn file() -> DiffFile {

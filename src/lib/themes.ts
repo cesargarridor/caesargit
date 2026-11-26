@@ -11,14 +11,19 @@ export interface Theme {
   accent: string;
   /** [added, modified, deleted, renamed, conflict] */
   git: [string, string, string, string, string];
-  /** 8 colores de carriles del grafo */
+  /** Colores de carriles del grafo (8-10; se completan hasta LANE_COUNT) */
   lanes: string[];
   panel?: string;
   elev?: string;
   line?: string;
 }
 
+export const LANE_COUNT = 10;
+
 export const THEMES: Theme[] = [
+  { id: "gitkraken", name: "GitKraken Dark", dark: true, bg: "#1B1F27", panel: "#232933", elev: "#2B3240", line: "#343C4B", text: "#D9DEE7", accent: "#00C7A0",
+    git: ["#3FD17C", "#F5A524", "#F0556A", "#4DA3FF", "#FF5C8A"],
+    lanes: ["#00C7A0", "#4DA3FF", "#F5A524", "#B07CFF", "#FF5C8A", "#F0556A", "#3FD17C", "#FF8A3D", "#22D3EE", "#E5D04F"] },
   { id: "auto", name: "Automático (sistema)", dark: true, bg: "#0D0E11", panel: "#13151A", elev: "#1A1D24", line: "#262A34", text: "#E5E7EB", accent: "#F59E0B",
     git: ["#10B981", "#F59E0B", "#EF4444", "#3B82F6", "#F43F5E"], lanes: ["#F59E0B", "#38BDF8", "#10B981", "#A78BFA", "#FB7185", "#2DD4BF", "#FBBF24", "#818CF8"] },
   { id: "graphite", name: "Graphite & Amber", dark: true, bg: "#0D0E11", panel: "#13151A", elev: "#1A1D24", line: "#262A34", text: "#E5E7EB", accent: "#F59E0B",
@@ -47,15 +52,15 @@ export const THEMES: Theme[] = [
     git: ["#859900", "#b58900", "#dc322f", "#268bd2", "#d33682"], lanes: ["#268bd2", "#859900", "#b58900", "#6c71c4", "#dc322f", "#2aa198", "#cb4b16", "#d33682"] },
 ];
 
-export const DEFAULT_THEME = "graphite";
+export const DEFAULT_THEME = "gitkraken";
 
 export const systemDark = (): boolean =>
   typeof window !== "undefined" && window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)").matches : true;
 
-/** «auto» elige Graphite (oscuro) o GitHub Light (claro) según el sistema. */
+/** «auto» elige GitKraken Dark (oscuro) o GitHub Light (claro) según el sistema. */
 export function resolveTheme(themeId: string): Theme {
-  const id = themeId === "auto" ? (systemDark() ? "graphite" : "github-light") : themeId;
-  return THEMES.find((x) => x.id === id) ?? THEMES.find((x) => x.id === "graphite")!;
+  const id = themeId === "auto" ? (systemDark() ? "gitkraken" : "github-light") : themeId;
+  return THEMES.find((x) => x.id === id) ?? THEMES.find((x) => x.id === "gitkraken")!;
 }
 
 export function useIsDarkTheme(themeId: string): boolean {
@@ -87,7 +92,7 @@ const lum = (c: RGB) => {
 
 /** Color CSS de una variable del tema, con alfa opcional: cv("accent", 0.2). */
 export const cv = (name: string, alpha?: number) => (alpha === undefined ? `rgb(var(--c-${name}))` : `rgb(var(--c-${name}) / ${alpha})`);
-export const laneVar = (i: number) => `rgb(var(--lane-${((i % 8) + 8) % 8}))`;
+export const laneVar = (i: number) => `rgb(var(--lane-${((i % LANE_COUNT) + LANE_COUNT) % LANE_COUNT}))`;
 
 export function applyTheme(themeId: string, accentOverride: string | null) {
   const t = resolveTheme(themeId);
@@ -120,7 +125,11 @@ export function applyTheme(themeId: string, accentOverride: string | null) {
   set("--c-sky", soft(t.git[3]));
   set("--c-emerald", soft(t.git[0]));
   set("--c-red", soft(t.git[2]));
-  t.lanes.forEach((c, i) => set(`--lane-${i}`, str(parse(c))));
+  // Hasta LANE_COUNT carriles: los temas con menos colores completan con tonos mezclados
+  for (let i = 0; i < LANE_COUNT; i++) {
+    const base = parse(t.lanes[i % t.lanes.length]);
+    set(`--lane-${i}`, str(i < t.lanes.length ? base : mix(base, t.dark ? white : black, 0.28)));
+  }
   set("--c-scrim", t.dark ? "0 0 0" : "30 41 59");
   root.style.colorScheme = t.dark ? "dark" : "light";
   root.dataset.theme = t.id;

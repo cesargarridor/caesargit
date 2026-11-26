@@ -2,9 +2,10 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
-  AppError, BranchInfo, GraphPage, GraphRow, ModalState, RepoInfo, RepoStatus, Selection,
-  StashEntry, TagInfo,
+  AppError, BranchInfo, GitProgress, GraphColumn, GraphFilter, GraphPage, GraphRow, ModalState, RemoteInfo,
+  RepoInfo, RepoStatus, Selection, StashEntry, Submodule, TagInfo, UndoState, Worktree,
 } from "../types/git";
+import { getRepoPrefs, usePrefs, type RepoPrefs } from "./usePrefs";
 
 export const PAGE_SIZE = 300;
 const RECENTS_KEY = "caesargit.recents";
@@ -23,7 +24,24 @@ export interface RepoTab {
   loading: boolean;
   loadingMore: boolean;
   busy: number; // operaciones de escritura en curso
+  undo: UndoState;
+  worktrees: Worktree[];
+  submodules: Submodule[];
+  remotes: RemoteInfo[];
+  graphFilter: GraphFilter;
+  selectedCommits: string[];
+  /** prefs persistidas del repo (colores, hidden/solo/pinned, columnas...) */
+  repoPrefs: RepoPrefs;
+  /** timestamp del último fetch/pull correcto */
+  lastFetch: number | null;
 }
+
+export const emptyFilter = (): GraphFilter => ({
+  includeRefs: [], excludeRefs: [], author: "", path: "", grep: "", since: "", pickaxe: "",
+});
+export const isFilterActive = (f: GraphFilter) =>
+  !!(f.includeRefs.length || f.excludeRefs.length || f.author || f.path || f.grep || f.since || f.pickaxe);
+const emptyUndo = (): UndoState => ({ undoLabel: null, redoLabel: null });
 
 export interface DialogField {
   key: string;
@@ -54,6 +72,44 @@ interface RepoState {
   paletteOpen: boolean;
   dialog: DialogState | null;
   toasts: Toast[];
+  /** pantalla «New Tab» (Open/Clone/Init) visible sobre la pestaña activa */
+  newTabOpen: boolean;
+  /** progreso global de operaciones largas (evento git-progress) */
+  progress: GitProgress | null;
+  // reflejo de la pestaña activa (consumido por F1b)
+  graphFilter: GraphFilter;
+  selectedCommits: string[];
+  hiddenRefs: string[];
+  soloRef: string | null;
+  pinnedRefs: string[];
+  branchColors: Record<string, number>;
+  columns: GraphColumn[];
+  undoState: UndoState;
+  worktrees: Worktree[];
+  submodules: Submodule[];
+  remotes: RemoteInfo[];
+
+  setNewTabOpen: (v: boolean) => void;
+  markFetched: (id: string) => void;
+  setProgress: (p: GitProgress | null) => void;
+  renameTab: (id: string, alias: string | null) => void;
+  reorderTabs: (fromId: string, toId: string) => void;
+  closeOthers: (id: string) => Promise<void>;
+  cycleTab: (dir: 1 | -1) => void;
+  activateIndex: (i: number) => void;
+  undo: () => Promise<void>;
+  redo: () => Promise<void>;
+  refreshUndo: (id?: string) => Promise<void>;
+  setGraphFilter: (patch: Partial<GraphFilter>) => void;
+  clearGraphFilter: () => void;
+  setSelectedCommits: (shas: string[]) => void;
+  toggleHidden: (ref: string) => void;
+  hideRefs: (refs: string[], hidden: boolean) => void;
+  toggleSolo: (ref: string) => void;
+  togglePin: (ref: string) => void;
+  setBranchColor: (ref: string, colorIdx: number | null) => void;
+  setColumns: (cols: GraphColumn[]) => void;
+  setRepoPrefs: (patch: Partial<RepoPrefs>) => void;
 
   activeTab: () => RepoTab | null;
   openRepo: (path: string) => Promise<void>;
@@ -90,7 +146,47 @@ export function toAppError(e: unknown): AppError {
   return { code: "unknown", message: String(e) };
 }
 
-const READ_ONLY = /^(get_|list_|search_|is_|blame_|file_history|last_commit_message|watch_|unwatch_|open_repo|resolve_conflict_preview)/;
+const READ_ONLY = /^(get_|list_|search_|is_|blame_|file_history|last_commit_message|watch_|unwatch_|open_repo|resolve_conflict_preview|undo_state|bisect_status|flow_status|read_hook|show_file|read_file|compare_|create_patch|init_templates|check_merge|repo_stats|hook_templates|lfs_status|lfs_locks|open_in_|reveal_in_|run_difftool|run_mergetool|save_patch)/;
+
+type GraphFetchArgs = {
+  cursor: number; limit: number; hasWip: boolean; includeStashes: boolean;
+  includeRefs?: string[]; excludeRefs?: string[]; author?: string; path?: string; grep?: string; since?: string; pickaxe?: string;
+};
+/** Argumentos de get_graph según filtros y prefs del repo. */
+export function graphArgs(t: RepoTab, hasFiles: boolean, cursor: number, limit: number): GraphFetchArgs {
+  const f = t.graphFilter;
+  const p = t.repoPrefs;
+  const include = p.soloRef ? [p.soloRef] : f.includeRefs;
+  const exclude = [...new Set([...f.excludeRefs, ...p.hiddenRefs])];
+  const filtered = !!(f.author || f.path || f.grep || f.since || f.pickaxe);
+  const a: GraphFetchArgs = { cursor, limit, hasWip: !filtered && hasFiles, includeStashes: !p.hideStashesInGraph };
+  if (include.length) a.includeRefs = include;
+  if (exclude.length) a.excludeRefs = exclude;
+  if (f.author) a.author = f.author;
+  if (f.path) a.path = f.path;
+  if (f.grep) a.grep = f.grep;
+  if (f.since) a.since = f.since;
+  if (f.pickaxe) a.pickaxe = f.pickaxe;
+  return a;
+}
+
+type Mirror = Pick<RepoState, "selection" | "modal" | "graphFilter" | "selectedCommits" | "hiddenRefs" | "soloRef"
+  | "pinnedRefs" | "branchColors" | "columns" | "undoState" | "worktrees" | "submodules" | "remotes">;
+const mirrorOf = (t: RepoTab | null | undefined): Mirror => ({
+  selection: t?.selection ?? null,
+  modal: t?.modal ?? null,
+  graphFilter: t?.graphFilter ?? emptyFilter(),
+  selectedCommits: t?.selectedCommits ?? [],
+  hiddenRefs: t?.repoPrefs.hiddenRefs ?? [],
+  soloRef: t?.repoPrefs.soloRef ?? null,
+  pinnedRefs: t?.repoPrefs.pinnedRefs ?? [],
+  branchColors: t?.repoPrefs.branchColors ?? {},
+  columns: t?.repoPrefs.columns ?? getRepoPrefs("").columns,
+  undoState: t?.undo ?? emptyUndo(),
+  worktrees: t?.worktrees ?? [],
+  submodules: t?.submodules ?? [],
+  remotes: t?.remotes ?? [],
+});
 
 function loadRecents(): string[] {
   try {
@@ -107,11 +203,11 @@ const refreshTokens = new Map<string, number>();
 export const useRepoStore = create<RepoState>((set, get) => {
   const patchTab = (id: string, patch: Partial<RepoTab> | ((t: RepoTab) => Partial<RepoTab>)) => {
     set((s) => {
-      let mirror: Partial<RepoState> = {};
+      let mirror: Partial<Mirror> = {};
       const tabs = s.tabs.map((t) => {
         if (t.info.id !== id) return t;
         const nt = { ...t, ...(typeof patch === "function" ? patch(t) : patch) };
-        if (id === s.activeId) mirror = { selection: nt.selection, modal: nt.modal };
+        if (id === s.activeId) mirror = mirrorOf(nt);
         return nt;
       });
       return { tabs, ...mirror };
@@ -138,11 +234,16 @@ export const useRepoStore = create<RepoState>((set, get) => {
     tabs: [],
     activeId: null,
     recents: loadRecents(),
-    selection: null,
-    modal: null,
     paletteOpen: false,
     dialog: null,
     toasts: [],
+    newTabOpen: false,
+    progress: null,
+    ...mirrorOf(null),
+
+    setNewTabOpen: (newTabOpen) => set({ newTabOpen }),
+    markFetched: (id) => patchTab(id, { lastFetch: Date.now() }),
+    setProgress: (progress) => set({ progress }),
 
     activeTab: activeOf,
 
@@ -152,13 +253,16 @@ export const useRepoStore = create<RepoState>((set, get) => {
         const existing = get().tabs.find((t) => t.info.id === info.id);
         if (existing) {
           get().setActive(info.id);
+          set({ newTabOpen: false });
           return;
         }
         const tab: RepoTab = {
           info, status: null, rows: [], nextCursor: null, total: null, branches: [], tags: [],
           stashes: [], selection: null, modal: null, loading: true, loadingMore: false, busy: 0,
+          undo: emptyUndo(), worktrees: [], submodules: [], remotes: [], graphFilter: emptyFilter(),
+          selectedCommits: [], repoPrefs: getRepoPrefs(info.path), lastFetch: null,
         };
-        set((s) => ({ tabs: [...s.tabs, tab], activeId: info.id, selection: null, modal: null }));
+        set((s) => ({ tabs: [...s.tabs, tab], activeId: info.id, newTabOpen: false, ...mirrorOf(tab) }));
         rememberRecent(info.path);
         invoke("watch_repo", { repoPath: info.path }).catch((e) => pushToast(toAppError(e).message));
         await get().refresh(info.id);
@@ -184,13 +288,124 @@ export const useRepoStore = create<RepoState>((set, get) => {
         activeId = tabs[Math.min(idx, tabs.length - 1)]?.info.id ?? null;
       }
       const next = tabs.find((x) => x.info.id === activeId);
-      set({ tabs, activeId, selection: next?.selection ?? null, modal: next?.modal ?? null });
+      set({ tabs, activeId, newTabOpen: false, ...mirrorOf(next) });
     },
 
     setActive: (id) => {
       const t = get().tabs.find((x) => x.info.id === id);
-      if (t) set({ activeId: id, selection: t.selection, modal: t.modal });
+      if (t) set({ activeId: id, newTabOpen: false, ...mirrorOf(t) });
     },
+
+    renameTab: (id, alias) => {
+      const t = get().tabs.find((x) => x.info.id === id);
+      if (t) usePrefs.getState().setAlias(t.info.path, alias);
+    },
+
+    reorderTabs: (fromId, toId) => {
+      if (fromId === toId) return;
+      const tabs = [...get().tabs];
+      const from = tabs.findIndex((t) => t.info.id === fromId);
+      const to = tabs.findIndex((t) => t.info.id === toId);
+      if (from < 0 || to < 0) return;
+      const [m] = tabs.splice(from, 1);
+      tabs.splice(to, 0, m);
+      set({ tabs });
+    },
+
+    closeOthers: async (id) => {
+      for (const t of get().tabs.filter((x) => x.info.id !== id)) await get().closeTab(t.info.id);
+      get().setActive(id);
+    },
+
+    cycleTab: (dir) => {
+      const { tabs, activeId } = get();
+      if (tabs.length < 2) return;
+      const i = tabs.findIndex((t) => t.info.id === activeId);
+      get().setActive(tabs[(i + dir + tabs.length) % tabs.length].info.id);
+    },
+
+    activateIndex: (i) => {
+      const { tabs } = get();
+      // ⌘9 = última pestaña, como en los navegadores
+      const t = i === 8 ? tabs[tabs.length - 1] : tabs[i];
+      if (t) get().setActive(t.info.id);
+    },
+
+    refreshUndo: async (id) => {
+      const tab = get().tabs.find((t) => t.info.id === (id ?? get().activeId));
+      if (!tab) return;
+      try {
+        const undo = await invoke<UndoState>("undo_state", { repoPath: tab.info.path });
+        patchTab(tab.info.id, { undo });
+      } catch { /* sin pila */ }
+    },
+
+    undo: async () => {
+      const label = await get().act<string>("undo_action");
+      if (label !== undefined) pushToast(`Deshecho: ${label}`, "info");
+    },
+    redo: async () => {
+      const label = await get().act<string>("redo_action");
+      if (label !== undefined) pushToast(`Rehecho: ${label}`, "info");
+    },
+
+    setGraphFilter: (patch) => {
+      const id = get().activeId;
+      if (!id) return;
+      patchTab(id, (t) => ({ graphFilter: { ...t.graphFilter, ...patch } }));
+      void get().refresh(id);
+    },
+    clearGraphFilter: () => {
+      const id = get().activeId;
+      if (!id) return;
+      patchTab(id, { graphFilter: emptyFilter() });
+      void get().refresh(id);
+    },
+    setSelectedCommits: (selectedCommits) => {
+      const id = get().activeId;
+      if (id) patchTab(id, { selectedCommits });
+    },
+
+    setRepoPrefs: (patch) => {
+      const t = activeOf();
+      if (!t) return;
+      usePrefs.getState().setRepoPrefs(t.info.path, patch);
+      patchTab(t.info.id, (x) => ({ repoPrefs: { ...x.repoPrefs, ...patch } }));
+    },
+    toggleHidden: (ref) => {
+      const t = activeOf();
+      if (!t) return;
+      get().hideRefs([ref], !t.repoPrefs.hiddenRefs.includes(ref));
+    },
+    hideRefs: (refs, hidden) => {
+      const t = activeOf();
+      if (!t) return;
+      const cur = new Set(t.repoPrefs.hiddenRefs);
+      refs.forEach((r) => (hidden ? cur.add(r) : cur.delete(r)));
+      get().setRepoPrefs({ hiddenRefs: [...cur] });
+      void get().refresh(t.info.id);
+    },
+    toggleSolo: (ref) => {
+      const t = activeOf();
+      if (!t) return;
+      get().setRepoPrefs({ soloRef: t.repoPrefs.soloRef === ref ? null : ref });
+      void get().refresh(t.info.id);
+    },
+    togglePin: (ref) => {
+      const t = activeOf();
+      if (!t) return;
+      const p = t.repoPrefs.pinnedRefs;
+      get().setRepoPrefs({ pinnedRefs: p.includes(ref) ? p.filter((x) => x !== ref) : [...p, ref] });
+    },
+    setBranchColor: (ref, colorIdx) => {
+      const t = activeOf();
+      if (!t) return;
+      const c = { ...t.repoPrefs.branchColors };
+      if (colorIdx === null) delete c[ref];
+      else c[ref] = colorIdx;
+      get().setRepoPrefs({ branchColors: c });
+    },
+    setColumns: (columns) => get().setRepoPrefs({ columns }),
 
     refresh: async (id) => {
       const tabId = id ?? get().activeId;
@@ -202,11 +417,17 @@ export const useRepoStore = create<RepoState>((set, get) => {
       try {
         const status = await invoke<RepoStatus>("get_status", { repoPath });
         const limit = Math.max(PAGE_SIZE, tab.rows.filter((r) => !r.isWip).length);
-        const [page, branches, tags, stashes] = await Promise.all([
-          invoke<GraphPage>("get_graph", { repoPath, cursor: 0, limit, hasWip: status.files.length > 0 }),
+        const cur = get().tabs.find((t) => t.info.id === tab.info.id) ?? tab;
+        const soft = <T,>(p: Promise<T>, d: T) => p.catch(() => d);
+        const [page, branches, tags, stashes, undo, worktrees, submodules, remotes] = await Promise.all([
+          invoke<GraphPage>("get_graph", { repoPath, ...graphArgs(cur, status.files.length > 0, 0, limit) }),
           invoke<BranchInfo[]>("list_branches", { repoPath }),
           invoke<TagInfo[]>("list_tags", { repoPath }),
           invoke<StashEntry[]>("list_stashes", { repoPath }),
+          soft(invoke<UndoState>("undo_state", { repoPath }), emptyUndo()),
+          soft(invoke<Worktree[]>("list_worktrees", { repoPath }), [] as Worktree[]),
+          soft(invoke<Submodule[]>("list_submodules", { repoPath }), [] as Submodule[]),
+          soft(invoke<RemoteInfo[]>("list_remotes", { repoPath }), [] as RemoteInfo[]),
         ]);
         if (refreshTokens.get(tab.info.id) !== token) return;
         patchTab(tab.info.id, (t) => {
@@ -215,7 +436,7 @@ export const useRepoStore = create<RepoState>((set, get) => {
           if (selection?.kind === "wip" && status.files.length === 0) selection = null;
           return {
             status, rows: page.rows, nextCursor: page.nextCursor, total: page.total,
-            branches, tags, stashes, loading: false, selection,
+            branches, tags, stashes, undo, worktrees, submodules, remotes, loading: false, selection,
           };
         });
       } catch (e) {
@@ -233,7 +454,7 @@ export const useRepoStore = create<RepoState>((set, get) => {
       patchTab(id, { loadingMore: true });
       try {
         const page = await invoke<GraphPage>("get_graph", {
-          repoPath: tab.info.path, cursor: tab.nextCursor, limit: PAGE_SIZE, hasWip: false,
+          repoPath: tab.info.path, ...graphArgs(tab, false, tab.nextCursor, PAGE_SIZE),
         });
         patchTab(id, (t) => ({
           rows: [...t.rows, ...page.rows], nextCursor: page.nextCursor, total: page.total, loadingMore: false,
@@ -251,7 +472,9 @@ export const useRepoStore = create<RepoState>((set, get) => {
       const write = !READ_ONLY.test(cmd);
       if (write) patchTab(id, (t) => ({ busy: t.busy + 1 }));
       try {
-        return await invoke<T>(cmd, { repoPath: tab.info.path, ...args });
+        const r = await invoke<T>(cmd, { repoPath: tab.info.path, ...args });
+        if (cmd === "fetch" || cmd === "pull") patchTab(id, { lastFetch: Date.now() });
+        return r;
       } catch (e) {
         const err = toAppError(e);
         pushToast(err.message);
@@ -279,6 +502,7 @@ export const useRepoStore = create<RepoState>((set, get) => {
     setModal: (modal) => {
       const id = get().activeId;
       if (id) patchTab(id, { modal });
+      else set({ modal }); // sin pestañas (pantalla New Tab): Clone/Init/Preferencias
     },
     setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
 

@@ -3,6 +3,8 @@
 //! ejecuta `git` con `executor` (lecturas sin mutex, escrituras serializadas por repo).
 use crate::error::{AppError, Result};
 use crate::git::models::*;
+use crate::git::ext_a::tracked;
+use crate::git::graph_engine::GraphFilter;
 use crate::git::{conflict, executor, graph_engine, parsers, patcher};
 use crate::security::arg_guard::*;
 use crate::security::path_guard;
@@ -11,11 +13,11 @@ use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- helpers
 
-async fn root(repo_path: &str) -> Result<PathBuf> {
+pub(crate) async fn root(repo_path: &str) -> Result<PathBuf> {
     path_guard::open_repo_root(repo_path).await
 }
 
-async fn rels(root: &Path, paths: &[String]) -> Result<Vec<String>> {
+pub(crate) async fn rels(root: &Path, paths: &[String]) -> Result<Vec<String>> {
     if paths.is_empty() {
         return Err(AppError::invalid_arg("no se indicó ninguna ruta"));
     }
@@ -26,29 +28,36 @@ fn log_format_arg() -> String {
     format!("--format={}", parsers::LOG_FORMAT)
 }
 
-async fn has_head(root: &Path) -> bool {
+pub(crate) async fn has_head(root: &Path) -> bool {
     executor::read(root, &["rev-parse", "-q", "--verify", "HEAD"]).await.is_ok()
 }
 
-async fn status_of(root: &Path) -> Result<RepoStatus> {
+pub(crate) async fn status_of(root: &Path) -> Result<RepoStatus> {
     let out = executor::read(root, &["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]).await?;
     let mut st = parsers::parse_status(&out);
     let gd = executor::git_dir(root).await?;
     st.operation = parsers::detect_operation(&gd);
+    // Worktree enlazado: su git-dir (`.git/worktrees/<n>`) difiere del directorio común.
+    if let Ok(common) = executor::read(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await {
+        let common = PathBuf::from(common.trim_end_matches(['\n', '\r']));
+        if std::fs::canonicalize(&common).ok() != std::fs::canonicalize(&gd).ok() {
+            st.worktree_name = gd.file_name().map(|n| n.to_string_lossy().into_owned());
+        }
+    }
     Ok(st)
 }
 
-async fn file_change(root: &Path, rel: &str) -> Result<Option<FileChange>> {
+pub(crate) async fn file_change(root: &Path, rel: &str) -> Result<Option<FileChange>> {
     let out = executor::read(root, &["status", "--porcelain=v2", "-z", "--untracked-files=all", "--", rel]).await?;
     Ok(parsers::parse_status(&out).files.into_iter().next())
 }
 
-async fn parents_count(root: &Path, sha: &str) -> Result<usize> {
+pub(crate) async fn parents_count(root: &Path, sha: &str) -> Result<usize> {
     let out = executor::read(root, &["rev-list", "--parents", "-n", "1", sha]).await?;
     Ok(out.split_whitespace().count().saturating_sub(1))
 }
 
-fn empty_diff(path: &str) -> DiffFile {
+pub(crate) fn empty_diff(path: &str) -> DiffFile {
     DiffFile {
         path: path.to_string(),
         old_path: None,
@@ -95,7 +104,11 @@ async fn untracked_diff(root: &Path, rel: &str) -> Result<DiffFile> {
     Ok(parsers::parse_diff(&patch).into_iter().next().unwrap_or(f))
 }
 
-async fn worktree_diff(root: &Path, rel: &str, staged: bool, ignore_ws: bool) -> Result<DiffFile> {
+pub(crate) fn context_arg(context: Option<u32>) -> Option<String> {
+    context.map(|n| format!("-U{}", n.min(100_000)))
+}
+
+pub(crate) async fn worktree_diff(root: &Path, rel: &str, staged: bool, ignore_ws: bool, context: Option<u32>) -> Result<DiffFile> {
     if !staged {
         if let Some(fc) = file_change(root, rel).await? {
             if fc.worktree == '?' {
@@ -103,7 +116,11 @@ async fn worktree_diff(root: &Path, rel: &str, staged: bool, ignore_ws: bool) ->
             }
         }
     }
+    let ctx = context_arg(context);
     let mut a = vec!["diff", "--no-color", "--no-ext-diff", "-M"];
+    if let Some(c) = ctx.as_deref() {
+        a.push(c);
+    }
     if staged {
         a.push("--cached");
     }
@@ -120,12 +137,27 @@ fn commit_args(sha: &str) -> Vec<String> {
     vec![log_format_arg(), "--decorate=full".into(), sha.into()]
 }
 
-async fn log_commits(root: &Path, extra: &[&str]) -> Result<Vec<CommitNode>> {
+pub(crate) async fn log_commits(root: &Path, extra: &[&str]) -> Result<Vec<CommitNode>> {
     let fmt = log_format_arg();
     let mut a: Vec<&str> = vec!["log", "--decorate=full", &fmt];
     a.extend_from_slice(extra);
     let out = executor::read(root, &a).await?;
     Ok(parsers::parse_log(&out))
+}
+
+/// `Nombre <correo@dominio>` sin saltos de línea.
+fn validate_co_author(s: &str) -> Result<()> {
+    let ok = s.len() <= 300
+        && !s.chars().any(|c| c.is_control())
+        && s.ends_with('>')
+        && s.matches('<').count() == 1
+        && s.matches('>').count() == 1
+        && s.find('<').is_some_and(|i| i > 0 && s[i..].contains('@'));
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::invalid_arg("coautor no válido (usa «Nombre <correo>»)"))
+    }
 }
 
 fn is_hex(s: &str) -> bool {
@@ -150,33 +182,132 @@ pub async fn get_status(repo_path: String) -> Result<RepoStatus> {
 // ---------------------------------------------------------------- grafo
 
 #[tauri::command]
-pub async fn get_graph(repo_path: String, cursor: u32, limit: u32, has_wip: bool) -> Result<GraphPage> {
+#[allow(clippy::too_many_arguments)]
+pub async fn get_graph(
+    repo_path: String,
+    cursor: u32,
+    limit: u32,
+    has_wip: bool,
+    include_refs: Option<Vec<String>>,
+    exclude_refs: Option<Vec<String>>,
+    author: Option<String>,
+    path: Option<String>,
+    grep: Option<String>,
+    since: Option<String>,
+    pickaxe: Option<String>,
+    pickaxe_mode: Option<String>,
+    include_stashes: Option<bool>,
+) -> Result<GraphPage> {
     let r = root(&repo_path).await?;
     if limit == 0 || limit > 5000 {
         return Err(AppError::invalid_arg("limit fuera de rango (1..5000)"));
     }
+    let nonempty = |o: Option<String>| o.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let mut f = GraphFilter { include_stashes: include_stashes.unwrap_or(false), ..Default::default() };
+    for n in include_refs.unwrap_or_default() {
+        validate_ref(&n)?;
+        f.include_refs.push(n);
+    }
+    for n in exclude_refs.unwrap_or_default() {
+        validate_ref(&n)?;
+        f.exclude_refs.push(n);
+    }
+    if let Some(a) = nonempty(author) {
+        f.author = Some(validate_search_text(&a)?.to_string());
+    }
+    if let Some(g) = nonempty(grep) {
+        f.grep = Some(validate_search_text(&g)?.to_string());
+    }
+    if let Some(d) = nonempty(since) {
+        f.since = Some(validate_date(&d)?.to_string());
+    }
+    if let Some(p) = nonempty(path) {
+        f.path = Some(path_guard::safe_rel(&r, &p)?);
+    }
+    if let Some(t) = nonempty(pickaxe) {
+        let mode = match pickaxe_mode.as_deref() {
+            None | Some("S") | Some("s") => 'S',
+            Some("G") | Some("g") => 'G',
+            _ => return Err(AppError::invalid_arg("pickaxeMode debe ser S o G")),
+        };
+        f.pickaxe = Some((mode, validate_search_text(&t)?.to_string()));
+    }
     if !has_head(&r).await {
         return Ok(GraphPage { rows: vec![], next_cursor: None, total: Some(0) });
     }
-    graph_engine::get_graph(&r, cursor, limit, has_wip).await
+    graph_engine::get_graph(&r, cursor, limit, has_wip, &f).await
 }
 
 #[tauri::command]
-pub async fn search_commits(repo_path: String, query: String) -> Result<Vec<CommitNode>> {
+pub async fn search_commits(
+    repo_path: String,
+    query: String,
+    scope: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+) -> Result<Vec<CommitNode>> {
     let r = root(&repo_path).await?;
     let q = query.trim();
-    if q.is_empty() || q.len() > 200 || q.contains('\0') || !has_head(&r).await {
+    let since = since.filter(|v| !v.trim().is_empty());
+    let until = until.filter(|v| !v.trim().is_empty());
+    if q.contains('\0') || q.len() > 200 || !has_head(&r).await {
         return Ok(vec![]);
     }
-    let grep = format!("--grep={q}");
-    let author = format!("--author={q}");
-    let mut all = log_commits(&r, &["--all", "-i", "--fixed-strings", "--max-count=200", &grep]).await?;
-    all.extend(log_commits(&r, &["--all", "-i", "--fixed-strings", "--max-count=200", &author]).await?);
-    if is_hex(q) {
-        let spec = format!("{q}^{{commit}}");
-        if let Ok(full) = executor::read(&r, &["rev-parse", "-q", "--verify", &spec]).await {
-            let full = full.trim().to_string();
-            all.extend(log_commits(&r, &["--max-count=1", &full]).await?);
+    let mut dates: Vec<String> = Vec::new();
+    if let Some(d) = since.as_deref() {
+        dates.push(format!("--since={}", validate_date(d)?));
+    }
+    if let Some(d) = until.as_deref() {
+        dates.push(format!("--until={}", validate_date(d)?));
+    }
+    if q.is_empty() && dates.is_empty() {
+        return Ok(vec![]);
+    }
+    let scope = scope.unwrap_or_else(|| "all".into());
+    let mut base: Vec<String> = vec!["--all".into(), "-i".into(), "--fixed-strings".into(), "--max-count=200".into()];
+    base.extend(dates);
+    let run = |extra: Vec<String>| {
+        let r = r.clone();
+        let base = base.clone();
+        async move {
+            let mut v: Vec<&str> = base.iter().map(String::as_str).collect();
+            v.extend(extra.iter().map(String::as_str));
+            log_commits(&r, &v).await
+        }
+    };
+    let mut all: Vec<CommitNode> = Vec::new();
+    if q.is_empty() {
+        all.extend(run(vec![]).await?);
+    } else {
+        validate_search_text(q)?;
+        match scope.as_str() {
+            "all" => {
+                all.extend(run(vec![format!("--grep={q}")]).await?);
+                all.extend(run(vec![format!("--author={q}")]).await?);
+                if is_hex(q) {
+                    let spec = format!("{q}^{{commit}}");
+                    if let Ok(full) = executor::read(&r, &["rev-parse", "-q", "--verify", &spec]).await {
+                        let full = full.trim().to_string();
+                        all.extend(log_commits(&r, &["--max-count=1", &full]).await?);
+                    }
+                }
+            }
+            "message" => all.extend(run(vec![format!("--grep={q}")]).await?),
+            "author" => all.extend(run(vec![format!("--author={q}")]).await?),
+            "sha" => {
+                if !is_hex(q) {
+                    return Ok(vec![]);
+                }
+                let spec = format!("{q}^{{commit}}");
+                if let Ok(full) = executor::read(&r, &["rev-parse", "-q", "--verify", &spec]).await {
+                    let full = full.trim().to_string();
+                    all.extend(log_commits(&r, &["--max-count=1", &full]).await?);
+                }
+            }
+            "file" => all.extend(run(vec!["--".into(), q.to_string()]).await?),
+            "pickaxeS" => all.extend(run(vec![format!("-S{q}")]).await?),
+            "pickaxeG" => all.extend(run(vec![format!("-G{q}")]).await?),
+            _ => return Err(AppError::invalid_arg("scope no válido (all|message|author|sha|file|pickaxeS|pickaxeG)")),
         }
     }
     let mut seen = std::collections::HashSet::new();
@@ -219,12 +350,18 @@ pub async fn checkout(repo_path: String, target: String, create: bool) -> Result
     let r = root(&repo_path).await?;
     if create {
         validate_branch_name(&target)?;
-        executor::write(&r, &["checkout", "-b", &target]).await?;
     } else {
         validate_ref(&target)?;
-        executor::write(&r, &["checkout", &target, "--"]).await?;
     }
-    Ok(())
+    tracked(&r, &format!("Checkout {target}"), async {
+        if create {
+            executor::write(&r, &["checkout", "-b", &target]).await?;
+        } else {
+            executor::write(&r, &["checkout", &target, "--"]).await?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -236,8 +373,11 @@ pub async fn create_branch(repo_path: String, name: String, start_point: Option<
         validate_ref(s)?;
         a.push(s);
     }
-    executor::write(&r, &a).await?;
-    Ok(())
+    tracked(&r, &format!("Crear rama {name}"), async {
+        executor::write(&r, &a).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -245,16 +385,22 @@ pub async fn rename_branch(repo_path: String, old: String, new: String) -> Resul
     let r = root(&repo_path).await?;
     validate_ref(&old)?;
     validate_branch_name(&new)?;
-    executor::write(&r, &["branch", "-m", &old, &new]).await?;
-    Ok(())
+    tracked(&r, &format!("Renombrar rama {old}"), async {
+        executor::write(&r, &["branch", "-m", &old, &new]).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn delete_branch(repo_path: String, name: String, force: bool) -> Result<()> {
     let r = root(&repo_path).await?;
     validate_ref(&name)?;
-    executor::write(&r, &["branch", if force { "-D" } else { "-d" }, &name]).await?;
-    Ok(())
+    tracked(&r, &format!("Borrar rama {name}"), async {
+        executor::write(&r, &["branch", if force { "-D" } else { "-d" }, &name]).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -276,28 +422,52 @@ pub async fn checkout_remote_branch(repo_path: String, remote_branch: String) ->
     validate_remote(remote)?;
     validate_branch_name(local)?;
     let local_ref = format!("refs/heads/{local}");
-    if executor::read(&r, &["show-ref", "--verify", "--quiet", &local_ref]).await.is_ok() {
-        executor::write(&r, &["checkout", local, "--"]).await?;
-    } else {
-        executor::write(&r, &["checkout", "--track", &remote_branch]).await?;
+    tracked(&r, &format!("Checkout {remote_branch}"), async {
+        if executor::read(&r, &["show-ref", "--verify", "--quiet", &local_ref]).await.is_ok() {
+            executor::write(&r, &["checkout", local, "--"]).await?;
+        } else {
+            executor::write(&r, &["checkout", "--track", &remote_branch]).await?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn merge_branch(repo_path: String, name: String, mode: Option<String>) -> Result<()> {
+    let r = root(&repo_path).await?;
+    validate_ref(&name)?;
+    let flag = match mode.as_deref().unwrap_or("default") {
+        "default" => None,
+        "no-ff" => Some("--no-ff"),
+        "ff-only" => Some("--ff-only"),
+        "squash" => Some("--squash"),
+        _ => return Err(AppError::invalid_arg("modo de merge no válido (default|no-ff|ff-only|squash)")),
+    };
+    let mut a: Vec<&str> = vec!["merge", "--no-edit"];
+    a.extend(flag);
+    a.push(&name);
+    tracked(&r, &format!("Merge {name}"), async {
+        executor::write(&r, &a).await?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn rebase_onto(repo_path: String, name: String, autostash: Option<bool>) -> Result<()> {
+    let r = root(&repo_path).await?;
+    validate_ref(&name)?;
+    let mut a: Vec<&str> = vec!["rebase"];
+    if autostash.unwrap_or(false) {
+        a.push("--autostash");
     }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn merge_branch(repo_path: String, name: String) -> Result<()> {
-    let r = root(&repo_path).await?;
-    validate_ref(&name)?;
-    executor::write(&r, &["merge", "--no-edit", &name]).await?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn rebase_onto(repo_path: String, name: String) -> Result<()> {
-    let r = root(&repo_path).await?;
-    validate_ref(&name)?;
-    executor::write(&r, &["rebase", &name]).await?;
-    Ok(())
+    a.push(&name);
+    tracked(&r, &format!("Rebase sobre {name}"), async {
+        executor::write(&r, &a).await?;
+        Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------- tags
@@ -316,16 +486,22 @@ pub async fn create_tag(repo_path: String, name: String, target: Option<String>,
         validate_ref(t)?;
         a.push(t);
     }
-    executor::write(&r, &a).await?;
-    Ok(())
+    tracked(&r, &format!("Crear tag {name}"), async {
+        executor::write(&r, &a).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn delete_tag(repo_path: String, name: String) -> Result<()> {
     let r = root(&repo_path).await?;
     validate_branch_name(&name)?;
-    executor::write(&r, &["tag", "-d", &name]).await?;
-    Ok(())
+    tracked(&r, &format!("Borrar tag {name}"), async {
+        executor::write(&r, &["tag", "-d", &name]).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -355,25 +531,53 @@ pub async fn fetch(repo_path: String, all: bool, prune: bool) -> Result<()> {
 }
 
 #[tauri::command]
-pub async fn pull(repo_path: String, mode: String) -> Result<()> {
+pub async fn pull(repo_path: String, mode: String, autostash: Option<bool>) -> Result<()> {
     let r = root(&repo_path).await?;
-    let a: Vec<&str> = match mode.as_str() {
+    let mut a: Vec<&str> = match mode.as_str() {
         "ff" => vec!["pull", "--ff-only"],
         "rebase" => vec!["pull", "--rebase"],
         "merge" => vec!["pull", "--no-rebase", "--no-edit"],
         _ => return Err(AppError::invalid_arg("modo de pull no válido (ff|rebase|merge)")),
     };
+    if autostash.unwrap_or(false) {
+        a.push("--autostash");
+    }
     executor::write(&r, &a).await?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn push(repo_path: String, force: bool, set_upstream: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub async fn push(
+    repo_path: String,
+    force: bool,
+    set_upstream: bool,
+    no_verify: Option<bool>,
+    tags: Option<bool>,
+    follow_tags: Option<bool>,
+    force_mode: Option<String>,
+) -> Result<()> {
     let r = root(&repo_path).await?;
     let has_upstream = executor::read(&r, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).await.is_ok();
     let mut a: Vec<String> = vec!["push".into()];
-    if force {
-        a.push("--force-with-lease".into());
+    match force_mode.as_deref() {
+        Some("force") => a.push("--force".into()),
+        Some("lease") => a.push("--force-with-lease".into()),
+        None | Some("") => {
+            if force {
+                a.push("--force-with-lease".into());
+            }
+        }
+        _ => return Err(AppError::invalid_arg("forceMode no válido (lease|force)")),
+    }
+    if no_verify.unwrap_or(false) {
+        a.push("--no-verify".into());
+    }
+    if tags.unwrap_or(false) {
+        a.push("--tags".into());
+    }
+    if follow_tags.unwrap_or(false) {
+        a.push("--follow-tags".into());
     }
     if set_upstream || !has_upstream {
         let branch = executor::read(&r, &["symbolic-ref", "--short", "HEAD"])
@@ -399,43 +603,81 @@ fn stash_ref(index: u32) -> String {
 }
 
 #[tauri::command]
-pub async fn stash_push(repo_path: String, message: Option<String>) -> Result<()> {
+pub async fn stash_push(
+    repo_path: String,
+    message: Option<String>,
+    untracked: Option<bool>,
+    include_ignored: Option<bool>,
+    staged_only: Option<bool>,
+    paths: Option<Vec<String>>,
+) -> Result<()> {
     let r = root(&repo_path).await?;
-    let mut a: Vec<&str> = vec!["stash", "push", "-u"];
+    let mut a: Vec<&str> = vec!["stash", "push"];
+    if include_ignored.unwrap_or(false) {
+        a.push("-a");
+    } else if untracked.unwrap_or(true) && !staged_only.unwrap_or(false) {
+        a.push("-u");
+    }
+    if staged_only.unwrap_or(false) {
+        a.push("--staged");
+    }
     if let Some(m) = message.as_deref().filter(|m| !m.trim().is_empty()) {
         a.extend(["-m", m]);
     }
-    executor::write(&r, &a).await?;
-    Ok(())
+    let rs = match paths.filter(|p| !p.is_empty()) {
+        Some(p) => rels(&r, &p).await?,
+        None => Vec::new(),
+    };
+    if !rs.is_empty() {
+        a.push("--");
+        a.extend(rs.iter().map(String::as_str));
+    }
+    tracked(&r, "Stash", async {
+        executor::write(&r, &a).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn stash_apply(repo_path: String, index: u32) -> Result<()> {
     let r = root(&repo_path).await?;
-    executor::write(&r, &["stash", "apply", &stash_ref(index)]).await?;
-    Ok(())
+    tracked(&r, "Aplicar stash", async {
+        executor::write(&r, &["stash", "apply", &stash_ref(index)]).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn stash_pop(repo_path: String, index: u32) -> Result<()> {
     let r = root(&repo_path).await?;
-    executor::write(&r, &["stash", "pop", &stash_ref(index)]).await?;
-    Ok(())
+    tracked(&r, "Pop stash", async {
+        executor::write(&r, &["stash", "pop", &stash_ref(index)]).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn stash_drop(repo_path: String, index: u32) -> Result<()> {
     let r = root(&repo_path).await?;
-    executor::write(&r, &["stash", "drop", &stash_ref(index)]).await?;
-    Ok(())
+    tracked(&r, "Descartar stash", async {
+        executor::write(&r, &["stash", "drop", &stash_ref(index)]).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn stash_branch(repo_path: String, index: u32, name: String) -> Result<()> {
     let r = root(&repo_path).await?;
     validate_branch_name(&name)?;
-    executor::write(&r, &["stash", "branch", &name, &stash_ref(index)]).await?;
-    Ok(())
+    tracked(&r, &format!("Rama {name} desde stash"), async {
+        executor::write(&r, &["stash", "branch", &name, &stash_ref(index)]).await?;
+        Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------- staging
@@ -446,36 +688,48 @@ pub async fn stage_paths(repo_path: String, paths: Vec<String>) -> Result<()> {
     let rs = rels(&r, &paths).await?;
     let mut a = vec!["add", "-A", "--"];
     a.extend(rs.iter().map(String::as_str));
-    executor::write(&r, &a).await?;
-    Ok(())
+    tracked(&r, "Stage", async {
+        executor::write(&r, &a).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn unstage_paths(repo_path: String, paths: Vec<String>) -> Result<()> {
     let r = root(&repo_path).await?;
     let rs = rels(&r, &paths).await?;
-    let mut a = if has_head(&r).await { vec!["reset", "-q", "HEAD", "--"] } else { vec!["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--"] };
-    a.extend(rs.iter().map(String::as_str));
-    executor::write(&r, &a).await?;
-    Ok(())
+    tracked(&r, "Unstage", async {
+        let mut a = if has_head(&r).await { vec!["reset", "-q", "HEAD", "--"] } else { vec!["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--"] };
+        a.extend(rs.iter().map(String::as_str));
+        executor::write(&r, &a).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn stage_all(repo_path: String) -> Result<()> {
     let r = root(&repo_path).await?;
-    executor::write(&r, &["add", "-A"]).await?;
-    Ok(())
+    tracked(&r, "Stage todo", async {
+        executor::write(&r, &["add", "-A"]).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn unstage_all(repo_path: String) -> Result<()> {
     let r = root(&repo_path).await?;
-    if has_head(&r).await {
-        executor::write(&r, &["reset", "-q"]).await?;
-    } else {
-        executor::write(&r, &["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", "."]).await?;
-    }
-    Ok(())
+    tracked(&r, "Unstage todo", async {
+        if has_head(&r).await {
+            executor::write(&r, &["reset", "-q"]).await?;
+        } else {
+            executor::write(&r, &["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", "."]).await?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Descarta cambios del working tree (no toca lo ya en stage): sin seguimiento -> `clean`,
@@ -504,7 +758,7 @@ async fn discard_rels(root: &Path, rs: &[String]) -> Result<()> {
 pub async fn discard_paths(repo_path: String, paths: Vec<String>) -> Result<()> {
     let r = root(&repo_path).await?;
     let rs = rels(&r, &paths).await?;
-    discard_rels(&r, &rs).await
+    tracked(&r, "Descartar cambios", discard_rels(&r, &rs)).await
 }
 
 #[tauri::command]
@@ -512,7 +766,7 @@ pub async fn discard_all(repo_path: String) -> Result<()> {
     let r = root(&repo_path).await?;
     let st = status_of(&r).await?;
     let rs: Vec<String> = st.files.iter().filter(|f| !f.conflicted && f.unstaged).map(|f| f.path.clone()).collect();
-    discard_rels(&r, &rs).await
+    tracked(&r, "Descartar todo", discard_rels(&r, &rs)).await
 }
 
 #[tauri::command]
@@ -551,10 +805,21 @@ pub async fn ignore_path(repo_path: String, path: String) -> Result<()> {
 // ---------------------------------------------------------------- diff
 
 #[tauri::command]
-pub async fn get_file_diff(repo_path: String, path: String, staged: bool, ignore_whitespace: bool) -> Result<DiffFile> {
+pub async fn get_file_diff(
+    repo_path: String,
+    path: String,
+    staged: bool,
+    ignore_whitespace: bool,
+    context_lines: Option<u32>,
+    word_diff: Option<bool>,
+) -> Result<DiffFile> {
     let r = root(&repo_path).await?;
     let rel = path_guard::safe_rel(&r, &path)?;
-    worktree_diff(&r, &rel, staged, ignore_whitespace).await
+    let mut f = worktree_diff(&r, &rel, staged, ignore_whitespace, context_lines).await?;
+    if word_diff.unwrap_or(false) {
+        parsers::apply_word_diff(std::slice::from_mut(&mut f));
+    }
+    Ok(f)
 }
 
 #[tauri::command]
@@ -570,17 +835,32 @@ pub async fn get_commit_files(repo_path: String, sha: String) -> Result<Vec<Diff
 }
 
 #[tauri::command]
-pub async fn get_commit_file_diff(repo_path: String, sha: String, path: String, ignore_whitespace: bool) -> Result<DiffFile> {
+pub async fn get_commit_file_diff(
+    repo_path: String,
+    sha: String,
+    path: String,
+    ignore_whitespace: bool,
+    context_lines: Option<u32>,
+    word_diff: Option<bool>,
+) -> Result<DiffFile> {
     let r = root(&repo_path).await?;
     validate_sha(&sha)?;
     let rel = path_guard::safe_rel(&r, &path)?;
+    let ctx = context_arg(context_lines);
     let mut a = vec!["show", "--no-color", "--no-ext-diff", "--format=", "-M", "--first-parent", "-m"];
+    if let Some(c) = ctx.as_deref() {
+        a.push(c);
+    }
     if ignore_whitespace {
         a.push("-w");
     }
     a.extend([sha.as_str(), "--", rel.as_str()]);
     let out = executor::read(&r, &a).await?;
-    Ok(parsers::parse_diff(&out).into_iter().next().unwrap_or_else(|| empty_diff(&rel)))
+    let mut f = parsers::parse_diff(&out).into_iter().next().unwrap_or_else(|| empty_diff(&rel));
+    if word_diff.unwrap_or(false) {
+        parsers::apply_word_diff(std::slice::from_mut(&mut f));
+    }
+    Ok(f)
 }
 
 #[tauri::command]
@@ -617,26 +897,38 @@ pub async fn apply_hunk(
     let r = root(&repo_path).await?;
     let rel = path_guard::safe_rel(&r, &path)?;
     let mut a: Vec<&str> = vec!["apply"];
-    match action.as_str() {
-        "stage" => a.extend(["--cached", "--recount"]),
-        "unstage" => a.extend(["--cached", "--recount", "--reverse"]),
-        "discard" => a.extend(["--recount", "--reverse"]),
+    let label = match action.as_str() {
+        "stage" => {
+            a.extend(["--cached", "--recount"]);
+            "Stage hunk"
+        }
+        "unstage" => {
+            a.extend(["--cached", "--recount", "--reverse"]);
+            "Unstage hunk"
+        }
+        "discard" => {
+            a.extend(["--recount", "--reverse"]);
+            "Descartar hunk"
+        }
         _ => return Err(AppError::invalid_arg("acción no válida (stage|unstage|discard)")),
-    }
+    };
     if staged && action == "stage" {
         return Err(AppError::invalid_arg("no se puede hacer stage de un hunk ya en stage"));
     }
-    if action == "stage" || action == "discard" {
-        ensure_tracked(&r, &rel).await?;
-    }
-    let file = worktree_diff(&r, &rel, staged, ignore_whitespace).await?;
-    let patch = patcher::build_hunk_patch(&file, hunk_index as usize).map_err(AppError::invalid_arg)?;
     if ignore_whitespace {
         a.push("--ignore-whitespace");
     }
     a.push("-");
-    executor::write_stdin(&r, &a, patch.as_bytes()).await?;
-    Ok(())
+    tracked(&r, label, async {
+        if action == "stage" || action == "discard" {
+            ensure_tracked(&r, &rel).await?;
+        }
+        let file = worktree_diff(&r, &rel, staged, ignore_whitespace, None).await?;
+        let patch = patcher::build_hunk_patch(&file, hunk_index as usize).map_err(AppError::invalid_arg)?;
+        executor::write_stdin(&r, &a, patch.as_bytes()).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -648,24 +940,37 @@ pub async fn apply_lines(repo_path: String, path: String, hunk_index: u32, line_
         "unstage" => true,
         _ => return Err(AppError::invalid_arg("acción no válida (stage|unstage)")),
     };
-    if !unstage {
-        ensure_tracked(&r, &rel).await?;
-    }
-    let file = worktree_diff(&r, &rel, unstage, false).await?;
-    let patch = patcher::build_lines_patch(&file, hunk_index as usize, &line_indices, unstage).map_err(AppError::invalid_arg)?;
-    let mut a = vec!["apply", "--cached", "--recount"];
-    if unstage {
-        a.push("--reverse");
-    }
-    a.push("-");
-    executor::write_stdin(&r, &a, patch.as_bytes()).await?;
-    Ok(())
+    tracked(&r, if unstage { "Unstage líneas" } else { "Stage líneas" }, async {
+        if !unstage {
+            ensure_tracked(&r, &rel).await?;
+        }
+        let file = worktree_diff(&r, &rel, unstage, false, None).await?;
+        let patch = patcher::build_lines_patch(&file, hunk_index as usize, &line_indices, unstage).map_err(AppError::invalid_arg)?;
+        let mut a = vec!["apply", "--cached", "--recount"];
+        if unstage {
+            a.push("--reverse");
+        }
+        a.push("-");
+        executor::write_stdin(&r, &a, patch.as_bytes()).await?;
+        Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------- commit
 
 #[tauri::command]
-pub async fn commit(repo_path: String, summary: String, description: String, amend: bool) -> Result<String> {
+#[allow(clippy::too_many_arguments)]
+pub async fn commit(
+    repo_path: String,
+    summary: String,
+    description: String,
+    amend: bool,
+    signoff: Option<bool>,
+    no_verify: Option<bool>,
+    co_authors: Option<Vec<String>>,
+    gpg_sign: Option<bool>,
+) -> Result<String> {
     let r = root(&repo_path).await?;
     if summary.trim().is_empty() {
         return Err(AppError::invalid_arg("el resumen del commit no puede estar vacío"));
@@ -678,12 +983,40 @@ pub async fn commit(repo_path: String, summary: String, description: String, ame
         msg.push_str("\n\n");
         msg.push_str(description.trim());
     }
+    let mut trailers = String::new();
+    for c in co_authors.unwrap_or_default() {
+        let c = c.trim();
+        if c.is_empty() {
+            continue;
+        }
+        validate_co_author(c)?;
+        trailers.push_str(&format!("Co-authored-by: {c}\n"));
+    }
+    if !trailers.is_empty() {
+        msg.push_str("\n\n");
+        msg.push_str(trailers.trim_end());
+    }
     msg.push('\n');
     let mut a = vec!["commit", "-F", "-"];
     if amend {
         a.push("--amend");
     }
-    executor::write_stdin(&r, &a, msg.as_bytes()).await?;
+    if signoff.unwrap_or(false) {
+        a.push("--signoff");
+    }
+    if no_verify.unwrap_or(false) {
+        a.push("--no-verify");
+    }
+    match gpg_sign {
+        Some(true) => a.push("-S"),
+        Some(false) => a.push("--no-gpg-sign"),
+        None => {}
+    }
+    tracked(&r, if amend { "Amend" } else { "Commit" }, async {
+        executor::write_stdin(&r, &a, msg.as_bytes()).await?;
+        Ok(())
+    })
+    .await?;
     let sha = executor::read(&r, &["rev-parse", "HEAD"]).await?;
     Ok(sha.trim().to_string())
 }
@@ -701,36 +1034,106 @@ pub async fn last_commit_message(repo_path: String) -> Result<String> {
 #[tauri::command]
 pub async fn undo_last_commit(repo_path: String) -> Result<()> {
     let r = root(&repo_path).await?;
-    executor::write(&r, &["reset", "--soft", "HEAD~1"]).await?;
-    Ok(())
+    tracked(&r, "Deshacer último commit", async {
+        executor::write(&r, &["reset", "--soft", "HEAD~1"]).await?;
+        Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------- commit-ops
 
 #[tauri::command]
-pub async fn cherry_pick(repo_path: String, sha: String) -> Result<()> {
+pub async fn cherry_pick(repo_path: String, shas: Vec<String>) -> Result<()> {
     let r = root(&repo_path).await?;
-    validate_sha(&sha)?;
-    let mut a = vec!["cherry-pick"];
-    if parents_count(&r, &sha).await? > 1 {
-        a.extend(["-m", "1"]);
+    let ordered = topo_order(&r, &shas, false).await?;
+    let mut has_merge = false;
+    for s in &ordered {
+        has_merge |= parents_count(&r, s).await? > 1;
     }
-    a.push(&sha);
-    executor::write_env(&r, &a, &[("GIT_EDITOR", "true")]).await?;
-    Ok(())
+    let label = if ordered.len() == 1 { "Cherry-pick".to_string() } else { format!("Cherry-pick de {} commits", ordered.len()) };
+    tracked(&r, &label, async {
+        if has_merge {
+            // `-m 1` solo vale para merges: uno a uno.
+            for s in &ordered {
+                let mut a = vec!["cherry-pick"];
+                if parents_count(&r, s).await? > 1 {
+                    a.extend(["-m", "1"]);
+                }
+                a.push(s);
+                executor::write_env(&r, &a, &[("GIT_EDITOR", "true")]).await?;
+            }
+        } else {
+            let mut a = vec!["cherry-pick"];
+            a.extend(ordered.iter().map(String::as_str));
+            executor::write_env(&r, &a, &[("GIT_EDITOR", "true")]).await?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-pub async fn revert_commit(repo_path: String, sha: String) -> Result<()> {
+pub async fn revert_commit(repo_path: String, shas: Vec<String>, no_commit: Option<bool>) -> Result<()> {
     let r = root(&repo_path).await?;
-    validate_sha(&sha)?;
-    let mut a = vec!["revert", "--no-edit"];
-    if parents_count(&r, &sha).await? > 1 {
-        a.extend(["-m", "1"]);
+    // Del más nuevo al más antiguo.
+    let ordered = topo_order(&r, &shas, true).await?;
+    let mut has_merge = false;
+    for s in &ordered {
+        has_merge |= parents_count(&r, s).await? > 1;
     }
-    a.push(&sha);
-    executor::write(&r, &a).await?;
-    Ok(())
+    let label = if ordered.len() == 1 { "Revert".to_string() } else { format!("Revert de {} commits", ordered.len()) };
+    tracked(&r, &label, async {
+        let batches: Vec<Vec<&String>> = if has_merge { ordered.iter().map(|s| vec![s]).collect() } else { vec![ordered.iter().collect()] };
+        for b in batches {
+            let mut a = vec!["revert", "--no-edit"];
+            if no_commit.unwrap_or(false) {
+                a.push("--no-commit");
+            }
+            if b.len() == 1 && parents_count(&r, b[0]).await? > 1 {
+                a.extend(["-m", "1"]);
+            }
+            a.extend(b.iter().map(|s| s.as_str()));
+            executor::write(&r, &a).await?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Valida y ordena `shas` topológicamente: padres antes que hijos (`newest_first=false`)
+/// o del más nuevo al más antiguo. Devuelve SHAs completos sin duplicados.
+pub(crate) async fn topo_order(root: &Path, shas: &[String], newest_first: bool) -> Result<Vec<String>> {
+    if shas.is_empty() {
+        return Err(AppError::invalid_arg("no se indicó ningún commit"));
+    }
+    if shas.len() > 500 {
+        return Err(AppError::invalid_arg("demasiados commits (máx. 500)"));
+    }
+    let mut full: Vec<String> = Vec::new();
+    for s in shas {
+        validate_sha(s)?;
+        let spec = format!("{s}^{{commit}}");
+        let f = executor::read(root, &["rev-parse", "-q", "--verify", &spec])
+            .await
+            .map_err(|_| AppError::invalid_arg("commit no encontrado"))?;
+        let f = f.trim().to_string();
+        if !full.contains(&f) {
+            full.push(f);
+        }
+    }
+    if full.len() == 1 {
+        return Ok(full);
+    }
+    let mut a: Vec<&str> = vec!["rev-list", "--topo-order"];
+    a.extend(full.iter().map(String::as_str));
+    let out = executor::read(root, &a).await?;
+    // rev-list: hijos antes que padres.
+    let mut ordered: Vec<String> = out.lines().map(str::trim).filter(|l| full.iter().any(|f| f == l)).map(String::from).collect();
+    if !newest_first {
+        ordered.reverse();
+    }
+    Ok(ordered)
 }
 
 #[tauri::command]
@@ -743,8 +1146,11 @@ pub async fn reset_to(repo_path: String, sha: String, mode: String) -> Result<()
         "hard" => "--hard",
         _ => return Err(AppError::invalid_arg("modo de reset no válido (soft|mixed|hard)")),
     };
-    executor::write(&r, &["reset", flag, &sha]).await?;
-    Ok(())
+    tracked(&r, &format!("Reset {mode}"), async {
+        executor::write(&r, &["reset", flag, &sha]).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -818,11 +1224,16 @@ fn editor_messages(items: &[RebaseTodoItem]) -> Vec<Option<String>> {
 pub async fn rebase_interactive(repo_path: String, base_sha: String, items: Vec<RebaseTodoItem>) -> Result<()> {
     let r = root(&repo_path).await?;
     validate_sha(&base_sha)?;
+    tracked(&r, "Rebase interactivo", scripted_rebase(&r, &base_sha, &items, false)).await
+}
+
+/// Rebase interactivo guiado por script (sin editor real). `base` ya validado.
+pub(crate) async fn scripted_rebase(r: &Path, base_sha: &str, items: &[RebaseTodoItem], autostash: bool) -> Result<()> {
     if items.is_empty() {
         return Err(AppError::invalid_arg("no hay commits que reordenar"));
     }
     let mut todo = String::new();
-    for it in &items {
+    for it in items {
         if !ACTIONS.contains(&it.action.as_str()) {
             return Err(AppError::invalid_arg("acción de rebase no válida"));
         }
@@ -833,7 +1244,7 @@ pub async fn rebase_interactive(repo_path: String, base_sha: String, items: Vec<
     let d = sh_path(dir.path())?;
     tokio::fs::write(dir.path().join("todo"), todo).await?;
     tokio::fs::write(dir.path().join("seq.sh"), format!("cat '{d}/todo' > \"$1\"\n")).await?;
-    let msgs = editor_messages(&items);
+    let msgs = editor_messages(items);
     for (n, m) in msgs.iter().enumerate() {
         if let Some(m) = m {
             let mut text = m.trim_end().to_string();
@@ -847,18 +1258,18 @@ pub async fn rebase_interactive(repo_path: String, base_sha: String, items: Vec<
     tokio::fs::write(dir.path().join("editor.sh"), editor).await?;
     let seq_env = format!("sh '{d}/seq.sh'");
     let ed_env = format!("sh '{d}/editor.sh'");
-    executor::write_env(
-        &r,
-        &["rebase", "-i", &base_sha],
-        &[("GIT_SEQUENCE_EDITOR", &seq_env), ("GIT_EDITOR", &ed_env)],
-    )
-    .await?;
+    let mut a = vec!["rebase", "-i"];
+    if autostash {
+        a.push("--autostash");
+    }
+    a.push(base_sha);
+    executor::write_env(r, &a, &[("GIT_SEQUENCE_EDITOR", &seq_env), ("GIT_EDITOR", &ed_env)]).await?;
     Ok(())
 }
 
 // ---------------------------------------------------------------- operación en curso
 
-async fn current_op(root: &Path) -> Result<String> {
+pub(crate) async fn current_op(root: &Path) -> Result<String> {
     let gd = executor::git_dir(root).await?;
     parsers::detect_operation(&gd).ok_or_else(|| AppError::invalid_arg("no hay ninguna operación en curso"))
 }
@@ -867,8 +1278,11 @@ async fn current_op(root: &Path) -> Result<String> {
 pub async fn op_continue(repo_path: String) -> Result<()> {
     let r = root(&repo_path).await?;
     let op = current_op(&r).await?;
-    executor::write_env(&r, &[op.as_str(), "--continue"], &[("GIT_EDITOR", "true"), ("GIT_SEQUENCE_EDITOR", "true")]).await?;
-    Ok(())
+    tracked(&r, &format!("Continuar {op}"), async {
+        executor::write_env(&r, &[op.as_str(), "--continue"], &[("GIT_EDITOR", "true"), ("GIT_SEQUENCE_EDITOR", "true")]).await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -994,14 +1408,14 @@ mod tests {
         assert!(!get_status(p.clone()).await.unwrap().files[0].staged);
         stage_all(p.clone()).await.unwrap();
 
-        let sha = commit(p.clone(), "primero".into(), "detalle".into(), false).await.unwrap();
+        let sha = commit(p.clone(), "primero".into(), "detalle".into(), false, None, None, None, None).await.unwrap();
         assert_eq!(sha.len(), 40);
         assert_eq!(last_commit_message(p.clone()).await.unwrap(), "primero\n\ndetalle");
         assert!(get_status(p.clone()).await.unwrap().files.is_empty());
 
         // diff + stage de hunk
         std::fs::write(d.join("a.txt"), "uno\nDOS\ntres\n").unwrap();
-        let df = get_file_diff(p.clone(), "a.txt".into(), false, false).await.unwrap();
+        let df = get_file_diff(p.clone(), "a.txt".into(), false, false, None, None).await.unwrap();
         assert_eq!(df.hunks.len(), 1);
         apply_hunk(p.clone(), "a.txt".into(), false, 0, "stage".into(), false).await.unwrap();
         let st = get_status(p.clone()).await.unwrap();
@@ -1018,9 +1432,9 @@ mod tests {
         create_branch(p.clone(), "feat".into(), None, true).await.unwrap();
         std::fs::write(d.join("b.txt"), "b\n").unwrap();
         stage_paths(p.clone(), vec!["b.txt".into()]).await.unwrap();
-        commit(p.clone(), "segundo".into(), String::new(), false).await.unwrap();
+        commit(p.clone(), "segundo".into(), String::new(), false, None, None, None, None).await.unwrap();
         checkout(p.clone(), "main".into(), false).await.unwrap();
-        merge_branch(p.clone(), "feat".into()).await.unwrap();
+        merge_branch(p.clone(), "feat".into(), None).await.unwrap();
         let bs = list_branches(p.clone()).await.unwrap();
         assert!(bs.iter().any(|b| b.name == "feat") && bs.iter().any(|b| b.name == "main" && b.is_head));
         rename_branch(p.clone(), "feat".into(), "feat2".into()).await.unwrap();
@@ -1032,7 +1446,7 @@ mod tests {
         // stash
         std::fs::write(d.join("a.txt"), "cambio\n").unwrap();
         std::fs::write(d.join("nuevo.txt"), "x\n").unwrap();
-        stash_push(p.clone(), Some("guardado".into())).await.unwrap();
+        stash_push(p.clone(), Some("guardado".into()), None, None, None, None).await.unwrap();
         assert!(get_status(p.clone()).await.unwrap().files.is_empty());
         let sts = list_stashes(p.clone()).await.unwrap();
         assert_eq!(sts.len(), 1);
@@ -1042,9 +1456,9 @@ mod tests {
         assert!(get_status(p.clone()).await.unwrap().files.is_empty());
 
         // grafo, búsqueda, historial, blame, undo
-        let g = get_graph(p.clone(), 0, 50, false).await.unwrap();
+        let g = get_graph(p.clone(), 0, 50, false, None, None, None, None, None, None, None, None, None).await.unwrap();
         assert!(!g.rows.is_empty());
-        assert!(!search_commits(p.clone(), "primero".into()).await.unwrap().is_empty());
+        assert!(!search_commits(p.clone(), "primero".into(), None, None, None).await.unwrap().is_empty());
         assert!(!file_history(p.clone(), "a.txt".into()).await.unwrap().is_empty());
         assert_eq!(blame_file(p.clone(), "a.txt".into(), None).await.unwrap().len(), 3);
         assert!(is_ancestor_of_head(p.clone(), sha.clone()).await.unwrap());
@@ -1062,7 +1476,7 @@ mod tests {
         for (n, c) in [("a", "1"), ("b", "2"), ("c", "3")] {
             std::fs::write(d.join(format!("{n}.txt")), c).unwrap();
             stage_all(p.clone()).await.unwrap();
-            commit(p.clone(), format!("commit {n}"), String::new(), false).await.unwrap();
+            commit(p.clone(), format!("commit {n}"), String::new(), false, None, None, None, None).await.unwrap();
         }
         let first = executor::read(d, &["rev-list", "--max-parents=0", "HEAD"]).await.unwrap();
         let first = first.trim().to_string();
@@ -1079,12 +1493,12 @@ mod tests {
         create_branch(p.clone(), "x".into(), None, true).await.unwrap();
         std::fs::write(d.join("a.txt"), "rama\n").unwrap();
         stage_all(p.clone()).await.unwrap();
-        commit(p.clone(), "en x".into(), String::new(), false).await.unwrap();
+        commit(p.clone(), "en x".into(), String::new(), false, None, None, None, None).await.unwrap();
         checkout(p.clone(), "main".into(), false).await.unwrap();
         std::fs::write(d.join("a.txt"), "main\n").unwrap();
         stage_all(p.clone()).await.unwrap();
-        commit(p.clone(), "en main".into(), String::new(), false).await.unwrap();
-        let e = merge_branch(p.clone(), "x".into()).await.unwrap_err();
+        commit(p.clone(), "en main".into(), String::new(), false, None, None, None, None).await.unwrap();
+        let e = merge_branch(p.clone(), "x".into(), None).await.unwrap_err();
         assert_eq!(e.code, "conflict");
         let st = get_status(p.clone()).await.unwrap();
         assert_eq!(st.operation.as_deref(), Some("merge"));

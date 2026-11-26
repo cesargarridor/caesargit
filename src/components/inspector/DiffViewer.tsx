@@ -1,116 +1,31 @@
-import { cv, laneVar } from "../../lib/themes";
-import { EmptyState } from "../layout/Visuals";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { EmptyState, DiffSkeleton } from "../layout/Visuals";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Decoration,
-  EditorView,
-  GutterMarker,
-  WidgetType,
-  gutter,
-  lineNumbers,
-  type DecorationSet,
+  Decoration, EditorView, GutterMarker, WidgetType, gutter, keymap, lineNumbers, type DecorationSet,
 } from "@codemirror/view";
-import {
-  EditorState,
-  Extension,
-  RangeSetBuilder,
-  StateEffect,
-  StateField,
-} from "@codemirror/state";
-import { MergeView, goToNextChunk, goToPreviousChunk, getChunks } from "@codemirror/merge";
-import { syntaxHighlighting, HighlightStyle, StreamLanguage } from "@codemirror/language";
-import { tags as t } from "@lezer/highlight";
-import { javascript } from "@codemirror/lang-javascript";
-import { rust } from "@codemirror/lang-rust";
-import { python } from "@codemirror/lang-python";
-import { json } from "@codemirror/lang-json";
-import { html } from "@codemirror/lang-html";
-import { css } from "@codemirror/lang-css";
-import { markdown } from "@codemirror/lang-markdown";
-import { sql } from "@codemirror/lang-sql";
-import { java } from "@codemirror/lang-java";
-import { ChevronDown, ChevronUp, Columns2, Rows2 } from "lucide-react";
+import { EditorState, RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
+import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+import { MergeView, unifiedMergeView, goToNextChunk, goToPreviousChunk, getChunks } from "@codemirror/merge";
+import { ChevronDown, ChevronUp, Columns2, Eye, Pencil, Rows2, Save, Text, X } from "lucide-react";
+import { useRepoStore } from "../../store/useRepoStore";
 import type { DiffFile, HunkAction } from "../../types/git";
+import { graphiteHighlight, graphiteTheme, langFor, useEditorDark } from "./cmTheme";
+import { useDiffPrefs, isImage, type ContextSize, type DiffMode } from "./fileUtils";
+import ImageDiff from "./ImageDiff";
 
-/* ---------- tema Graphite & Amber + lenguajes (compartido con merge/) ---------- */
-
-export const graphiteTheme: Extension = EditorView.theme(
-  {
-    "&": { backgroundColor: cv("app"), color: cv("text"), fontSize: "12px", height: "100%" },
-    ".cm-scroller": {
-      fontFamily: '"JetBrains Mono","Fira Code",ui-monospace,monospace',
-      fontVariantLigatures: "contextual",
-      lineHeight: "1.55",
-    },
-    ".cm-content": { caretColor: cv("accent") },
-    ".cm-cursor": { borderLeftColor: cv("accent") },
-    "&.cm-focused": { outline: "none" },
-    ".cm-gutters": { backgroundColor: cv("panel"), color: cv("gray-500"), border: "none", borderRight: `1px solid ${cv("line")}` },
-    ".cm-activeLine": { backgroundColor: cv("accent", .06) },
-    ".cm-activeLineGutter": { backgroundColor: cv("accent", .10) },
-    ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": { backgroundColor: cv("accent", .22) + " !important" },
-    ".cm-changedLine": { backgroundColor: cv("git-added", .10) },
-    ".cm-deletedChunk": { backgroundColor: cv("git-deleted", .10) },
-    ".cm-changedText": { backgroundColor: cv("git-added", .28) },
-    ".cm-deletedChunk .cm-deletedText": { backgroundColor: cv("git-deleted", .30) },
-    ".cm-merge-a .cm-changedLine, .cm-merge-a .cm-deletedLine": { backgroundColor: cv("git-deleted", .10) },
-    ".cm-merge-b .cm-changedLine, .cm-merge-b .cm-insertedLine": { backgroundColor: cv("git-added", .10) },
-    ".cm-collapsedLines": { backgroundColor: cv("elev"), color: cv("gray-400") },
-    ".cm-d-add": { backgroundColor: cv("git-added", .12) },
-    ".cm-d-del": { backgroundColor: cv("git-deleted", .12) },
-    ".cm-d-hunk": { backgroundColor: cv("elev"), color: cv("accent"), borderTop: `1px solid ${cv("line")}` },
-    ".cm-d-sel": { boxShadow: `inset 2px 0 0 ${cv("accent")}` },
-    ".cm-ln": { minWidth: "34px", textAlign: "right", padding: "0 4px", fontSize: "10px" },
-    ".cm-pick": { cursor: "pointer", width: "14px", textAlign: "center", color: cv("gray-500") },
-    ".cm-pick.on": { color: cv("accent") },
-    ".cm-hunk-btns button": {
-      marginLeft: "6px", padding: "0 6px", border: `1px solid ${cv("line")}`, borderRadius: "4px",
-      background: cv("panel"), color: cv("text"), fontSize: "11px", cursor: "pointer",
-    },
-    ".cm-hunk-btns button:hover": { borderColor: cv("accent"), color: cv("accent") },
-    ".cm-hunk-btns": { float: "right" },
-  },
-  { dark: true },
-);
-
-const hl = HighlightStyle.define([
-  { tag: [t.keyword, t.modifier, t.operatorKeyword], color: cv("accent") },
-  { tag: [t.string, t.special(t.string)], color: cv("git-added") },
-  { tag: [t.number, t.bool, t.null], color: laneVar(3) },
-  { tag: [t.comment, t.lineComment, t.blockComment], color: cv("gray-500"), fontStyle: "italic" },
-  { tag: [t.function(t.variableName), t.propertyName], color: cv("git-renamed") },
-  { tag: [t.typeName, t.className, t.tagName], color: cv("git-modified") },
-  { tag: [t.definition(t.variableName)], color: cv("text") },
-  { tag: [t.operator, t.punctuation], color: cv("gray-400") },
-]);
-export const graphiteHighlight: Extension = syntaxHighlighting(hl);
-
-export function langFor(path: string): Extension {
-  const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  switch (ext) {
-    case "js": case "jsx": case "mjs": case "cjs": return javascript({ jsx: true });
-    case "ts": case "tsx": return javascript({ jsx: true, typescript: true });
-    case "rs": return rust();
-    case "py": return python();
-    case "json": return json();
-    case "html": case "htm": case "vue": return html();
-    case "css": case "scss": return css();
-    case "md": case "markdown": return markdown();
-    case "sql": return sql();
-    case "java": return java();
-    default: return StreamLanguage.define({ token: (s) => { s.skipToEnd(); return null; } });
-  }
-}
-
-/* ---------- tipos ---------- */
+// compatibilidad con importadores antiguos
+export { graphiteHighlight, graphiteTheme, langFor } from "./cmTheme";
 
 export type DiffContext = "unstaged" | "staged" | "commit";
 
 interface Props {
   diff: DiffFile;
   context: DiffContext;
-  ignoreWhitespace: boolean;
-  onIgnoreWhitespace: (v: boolean) => void;
+  /** sha del commit (contexto commit/compare) para «View file» e imágenes */
+  rev?: string;
+  /** revisiones explícitas (comparaciones); null = lado inexistente */
+  revs?: { old: string | null; new: string | null };
+  onClose?: () => void;
   onHunkAction?: (hunkIndex: number, action: HunkAction) => void;
   onLinesAction?: (hunkIndex: number, lineIndices: number[], action: "stage" | "unstage") => void;
 }
@@ -154,7 +69,6 @@ class TextMarker extends GutterMarker {
     return d;
   }
 }
-
 class HunkBtns extends WidgetType {
   constructor(
     readonly hunk: number,
@@ -176,21 +90,75 @@ class HunkBtns extends WidgetType {
   ignoreEvent() { return true; }
 }
 
+/* ---------- vista de archivo completo / editor ---------- */
+
+function CodeView({ path, text, editable, onSave, onDirty, getDoc }: {
+  path: string; text: string; editable: boolean; onSave?: (content: string) => void; onDirty?: (d: boolean) => void;
+  getDoc?: React.MutableRefObject<(() => string) | null>;
+}) {
+  const host = useRef<HTMLDivElement>(null);
+  const dark = useEditorDark();
+  const saveRef = useRef(onSave);
+  saveRef.current = onSave;
+  const dirtyRef = useRef(onDirty);
+  dirtyRef.current = onDirty;
+  useEffect(() => {
+    const el = host.current;
+    if (!el) return;
+    const view = new EditorView({
+      parent: el,
+      state: EditorState.create({
+        doc: text,
+        extensions: [
+          lineNumbers(), graphiteTheme(dark), graphiteHighlight, langFor(path),
+          ...(editable
+            ? [
+                history(),
+                keymap.of([
+                  { key: "Mod-s", preventDefault: true, run: (v) => { saveRef.current?.(v.state.doc.toString()); return true; } },
+                  ...defaultKeymap, ...historyKeymap,
+                ]),
+                EditorView.updateListener.of((u) => { if (u.docChanged) dirtyRef.current?.(true); }),
+              ]
+            : [EditorState.readOnly.of(true), EditorView.editable.of(false)]),
+        ],
+      }),
+    });
+    if (getDoc) getDoc.current = () => view.state.doc.toString();
+    if (editable) view.focus();
+    return () => { if (getDoc) getDoc.current = null; view.destroy(); };
+  }, [text, path, editable, dark]);
+  return <div ref={host} className="min-h-0 flex-1 overflow-auto" />;
+}
+
+const CONTEXTS: { v: ContextSize; l: string }[] = [
+  { v: 3, l: "3 líneas" }, { v: 10, l: "10 líneas" }, { v: 25, l: "25 líneas" }, { v: "full", l: "Archivo completo" },
+];
+
 /* ---------- componente ---------- */
 
 export default function DiffViewer(props: Props) {
-  const { diff, context, ignoreWhitespace, onIgnoreWhitespace } = props;
-  const [mode, setMode] = useState<"unified" | "split">("unified");
+  const { diff, context, rev, revs, onClose } = props;
+  const prefs = useDiffPrefs();
+  const { mode, ignoreWhitespace, wordDiff, context: ctxSize } = prefs;
+  const run = useRepoStore((s) => s.run);
+  const dark = useEditorDark();
   const [cur, setCur] = useState(0);
   const [selCount, setSelCount] = useState(0);
+  const [body, setBody] = useState<"diff" | "file" | "edit">("diff");
+  const [fileText, setFileText] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [svgText, setSvgText] = useState(false);
+  const docGetter = useRef<(() => string) | null>(null);
+  const [total, setTotal] = useState(diff.hunks.length);
   const host = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const mergeRef = useRef<MergeView | null>(null);
   const propsRef = useRef(props);
   propsRef.current = props;
   const selHunk = useRef<number | null>(null);
-  const hunkStarts = useRef<number[]>([]); // línea (1-based) de cada cabecera
-  const editable = context !== "commit";
+  const hunkStarts = useRef<number[]>([]);
+  const editable = context !== "commit" && !revs;
 
   const built = useMemo(() => {
     const lines: string[] = [];
@@ -221,17 +189,23 @@ export default function DiffViewer(props: Props) {
   }, [diff]);
   hunkStarts.current = built.starts;
 
+  // reset al cambiar de archivo
+  useEffect(() => { setBody("diff"); setFileText(null); setDirty(false); setSvgText(false); }, [diff.path, rev]);
+
+  const showImage = isImage(diff.path) && !(svgText && diff.path.toLowerCase().endsWith(".svg"));
+
   useEffect(() => {
     const el = host.current;
-    if (!el) return;
+    if (!el || body !== "diff" || showImage) return;
     el.innerHTML = "";
     viewRef.current = null;
     mergeRef.current = null;
     selHunk.current = null;
     setSelCount(0);
     setCur(0);
+    setTotal(diff.hunks.length);
     if (diff.binary || diff.hunks.length === 0) return;
-    const base = [graphiteTheme, graphiteHighlight, langFor(diff.path), EditorState.readOnly.of(true), EditorView.editable.of(false)];
+    const base = [graphiteTheme(dark), graphiteHighlight, langFor(diff.path), EditorState.readOnly.of(true), EditorView.editable.of(false)];
 
     if (mode === "split") {
       const mv = new MergeView({
@@ -243,7 +217,24 @@ export default function DiffViewer(props: Props) {
         collapseUnchanged: { margin: 3, minSize: 4 },
       });
       mergeRef.current = mv;
+      setTotal(getChunks(mv.b.state)?.chunks.length ?? 0);
       return () => { mv.destroy(); mergeRef.current = null; };
+    }
+
+    if (mode === "inline") {
+      const v = new EditorView({
+        parent: el,
+        state: EditorState.create({
+          doc: built.mod,
+          extensions: [
+            ...base, lineNumbers(),
+            unifiedMergeView({ original: built.orig, mergeControls: false, highlightChanges: true, gutter: true, collapseUnchanged: { margin: 3, minSize: 4 } }),
+          ],
+        }),
+      });
+      viewRef.current = v;
+      setTotal(getChunks(v.state)?.chunks.length ?? 0);
+      return () => { v.destroy(); viewRef.current = null; };
     }
 
     const decos = (state: EditorState): DecorationSet => {
@@ -252,7 +243,8 @@ export default function DiffViewer(props: Props) {
       for (let n = 1; n <= state.doc.lines; n++) {
         const r = built.refs[n - 1];
         const h = diff.hunks[r.hunk];
-        const pos = state.doc.line(n).from;
+        const ln = state.doc.line(n);
+        const pos = ln.from;
         if (r.idx < 0) {
           b.add(pos, pos, Decoration.line({ class: "cm-d-hunk" }));
           if (editable && propsRef.current.onHunkAction) {
@@ -260,13 +252,23 @@ export default function DiffViewer(props: Props) {
               context === "unstaged"
                 ? [{ label: "Stage Hunk", action: "stage" }, { label: "Discard Hunk", action: "discard" }]
                 : [{ label: "Unstage Hunk", action: "unstage" }];
-            b.add(state.doc.line(n).to, state.doc.line(n).to,
-              Decoration.widget({ widget: new HunkBtns(r.hunk, btns, (hi, a) => propsRef.current.onHunkAction?.(hi, a)), side: 1 }));
+            b.add(ln.to, ln.to, Decoration.widget({ widget: new HunkBtns(r.hunk, btns, (hi, a) => propsRef.current.onHunkAction?.(hi, a)), side: 1 }));
           }
         } else {
-          const k = h.lines[r.idx].kind;
+          const dl = h.lines[r.idx];
+          const k = dl.kind;
           const cls = (k === "add" ? "cm-d-add" : k === "del" ? "cm-d-del" : "") + (sel.has(n) ? " cm-d-sel" : "");
           if (cls.trim()) b.add(pos, pos, Decoration.line({ class: cls }));
+          if (wordDiff && dl.words && k !== "ctx") {
+            let off = pos + 1;
+            const wcls = k === "add" ? "cm-w-add" : "cm-w-del";
+            for (const w of dl.words) {
+              const to = Math.min(off + w.text.length, ln.to);
+              if (w.changed && to > off) b.add(off, to, Decoration.mark({ class: wcls }));
+              off += w.text.length;
+              if (off >= ln.to) break;
+            }
+          }
         }
       }
       return b.finish();
@@ -307,27 +309,23 @@ export default function DiffViewer(props: Props) {
         },
       },
     });
-
     const view = new EditorView({
       parent: el,
       state: EditorState.create({
         doc: built.text,
-        extensions: [selField, decoField, pickGutter, numGutter, graphiteTheme, graphiteHighlight, EditorState.readOnly.of(true), EditorView.editable.of(false)],
+        extensions: [selField, decoField, pickGutter, numGutter, ...base],
       }),
     });
     viewRef.current = view;
     return () => { view.destroy(); viewRef.current = null; };
-  }, [diff, mode, built, context, editable]);
-
-  const total = diff.hunks.length;
+  }, [diff, mode, built, context, editable, wordDiff, dark, body, showImage]);
 
   const jump = (dir: 1 | -1) => {
-    if (mode === "split") {
-      const mv = mergeRef.current;
-      if (!mv) return;
-      (dir === 1 ? goToNextChunk : goToPreviousChunk)(mv.b);
-      const chunks = getChunks(mv.b.state)?.chunks.length ?? 0;
-      setCur((c) => Math.max(0, Math.min(Math.max(chunks - 1, 0), c + dir)));
+    if (mode === "split" || mode === "inline") {
+      const v = mode === "split" ? mergeRef.current?.b : viewRef.current;
+      if (!v) return;
+      (dir === 1 ? goToNextChunk : goToPreviousChunk)(v);
+      setCur((c) => Math.max(0, Math.min(Math.max(total - 1, 0), c + dir)));
       return;
     }
     const v = viewRef.current;
@@ -335,8 +333,7 @@ export default function DiffViewer(props: Props) {
     const next = Math.max(0, Math.min(total - 1, cur + dir));
     const ln = hunkStarts.current[next];
     if (!ln) return;
-    const pos = v.state.doc.line(ln).from;
-    v.dispatch({ effects: EditorView.scrollIntoView(pos, { y: "start", yMargin: 4 }) });
+    v.dispatch({ effects: EditorView.scrollIntoView(v.state.doc.line(ln).from, { y: "start", yMargin: 4 }) });
     setCur(next);
   };
 
@@ -351,42 +348,127 @@ export default function DiffViewer(props: Props) {
     props.onLinesAction?.(hi, idx, action);
   };
 
+  /* ---- ver archivo / editar ---- */
+  const viewRev = context === "unstaged" ? "WORKTREE" : context === "staged" ? "INDEX" : revs?.new ?? rev ?? "HEAD";
+  const loadFile = useCallback(async (kind: "file" | "edit") => {
+    setFileText(null);
+    setBody(kind);
+    setDirty(false);
+    try {
+      const t = kind === "edit"
+        ? await run<string>("read_file", { path: diff.path })
+        : await run<string>("show_file", { rev: viewRev, path: diff.path });
+      setFileText(t);
+    } catch {
+      setBody("diff");
+    }
+  }, [run, diff.path, viewRev]);
+
+  const save = useCallback(async (content: string) => {
+    try {
+      await run("write_file", { path: diff.path, content });
+      setDirty(false);
+      useRepoStore.getState().toast("Guardado", "info");
+    } catch { /* toast ya mostrado */ }
+  }, [run, diff.path]);
+
+  const closeBody = async () => {
+    if (body === "edit" && dirty) {
+      const ok = await useRepoStore.getState().confirm({ title: "Cambios sin guardar", message: "Se perderán las ediciones del archivo.", confirmLabel: "Descartar ediciones", danger: true });
+      if (!ok) return;
+    }
+    setBody("diff");
+  };
+
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (useRepoStore.getState().dialog) return;
+      if (body !== "diff") { e.stopPropagation(); void closeBody(); }
+      else if (onClose) { e.stopPropagation(); onClose(); }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  });
+
+  const imageRevs = useMemo(() => {
+    const added = diff.status.startsWith("A") || diff.status.startsWith("?");
+    const removed = diff.status.startsWith("D");
+    let o: string | null; let n: string | null;
+    if (revs) { o = revs.old; n = revs.new; }
+    else if (context === "unstaged") { o = "INDEX"; n = "WORKTREE"; }
+    else if (context === "staged") { o = "HEAD"; n = "INDEX"; }
+    else { o = rev ? `${rev}^` : null; n = rev ?? null; }
+    return { oldRev: added ? null : o, newRev: removed ? null : n, oldPath: diff.oldPath ?? diff.path, newPath: diff.path };
+  }, [diff, revs, context, rev]);
+
+  const tbtn = "flex items-center gap-1 rounded px-1.5 py-0.5 text-gray-400 hover:bg-elev hover:text-amber disabled:opacity-40";
+  const canEdit = editable && !diff.status.startsWith("D") && !isImage(diff.path);
+  const canView = !diff.status.startsWith("D") && !isImage(diff.path) || (diff.path.toLowerCase().endsWith(".svg"));
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-app">
       <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line bg-panel px-2 py-1 text-xs">
-        <span className="truncate font-mono text-gray-300" title={diff.path}>{diff.path}</span>
+        <span className="min-w-0 max-w-[40%] truncate font-mono text-gray-300" title={diff.path}>{diff.path}</span>
         <span className="text-git-added">+{diff.additions}</span>
         <span className="text-git-deleted">-{diff.deletions}</span>
         <span className="flex-1" />
-        {selCount > 0 && editable && (
+        {selCount > 0 && editable && body === "diff" && mode === "hunk" && (
+          <button className="rounded bg-amber px-2 py-0.5 font-medium text-onacc hover:bg-amber-hover" onClick={() => doLines(context === "staged" ? "unstage" : "stage")}>
+            {context === "staged" ? "Unstage" : "Stage"} Selected Lines ({selCount})
+          </button>
+        )}
+        {body === "edit" && (
+          <button disabled={!dirty} onClick={() => void save(docGetter.current?.() ?? "")}
+            className="flex items-center gap-1 rounded bg-amber px-2 py-0.5 font-medium text-onacc hover:bg-amber-hover disabled:opacity-40" title="⌘S">
+            <Save size={12} /> Guardar{dirty ? " *" : ""}
+          </button>
+        )}
+        {body === "diff" && !showImage && (
           <>
-            {context === "unstaged" && (
-              <button className="rounded bg-amber px-2 py-0.5 font-medium text-onacc hover:bg-amber-hover" onClick={() => doLines("stage")}>
-                Stage Selected Lines ({selCount})
-              </button>
-            )}
-            {context === "staged" && (
-              <button className="rounded bg-amber px-2 py-0.5 font-medium text-onacc hover:bg-amber-hover" onClick={() => doLines("unstage")}>
-                Unstage Selected Lines ({selCount})
-              </button>
-            )}
+            <label className="flex cursor-pointer items-center gap-1 text-gray-400">
+              <input type="checkbox" className="accent-amber" checked={ignoreWhitespace} onChange={(e) => prefs.set({ ignoreWhitespace: e.target.checked })} />
+              Whitespace
+            </label>
+            <label className="flex cursor-pointer items-center gap-1 text-gray-400" title="Resalta las palabras cambiadas (vista Hunk)">
+              <input type="checkbox" className="accent-amber" checked={wordDiff} onChange={(e) => prefs.set({ wordDiff: e.target.checked })} />
+              Word diff
+            </label>
+            <select value={String(ctxSize)} onChange={(e) => prefs.set({ context: (e.target.value === "full" ? "full" : Number(e.target.value)) as ContextSize })}
+              className="rounded border border-line bg-app px-1 py-0.5 text-gray-300" title="Líneas de contexto">
+              {CONTEXTS.map((c) => <option key={c.v} value={String(c.v)}>{c.l}</option>)}
+            </select>
+            <button title="Cambio anterior" className={tbtn} onClick={() => jump(-1)}><ChevronUp size={14} /></button>
+            <button title="Cambio siguiente" className={tbtn} onClick={() => jump(1)}><ChevronDown size={14} /></button>
+            <span className="text-gray-500">{total > 0 ? `${Math.min(cur + 1, total)}/${total}` : "0/0"}</span>
+            <div className="flex overflow-hidden rounded border border-line">
+              {([["hunk", "Hunk", Text], ["inline", "Inline", Rows2], ["split", "Split", Columns2]] as [DiffMode, string, typeof Text][]).map(([m, l, Icon]) => (
+                <button key={m} onClick={() => prefs.set({ mode: m })} title={l}
+                  className={`flex items-center gap-1 px-2 py-0.5 ${mode === m ? "bg-elev text-amber" : "text-gray-400"}`}><Icon size={12} />{l}</button>
+              ))}
+            </div>
           </>
         )}
-        <label className="flex cursor-pointer items-center gap-1 text-gray-400">
-          <input type="checkbox" className="accent-amber" checked={ignoreWhitespace} onChange={(e) => onIgnoreWhitespace(e.target.checked)} />
-          Ignorar espacios (-w)
-        </label>
-        <button title="Hunk anterior" className="rounded p-1 text-gray-400 hover:bg-elev hover:text-amber" onClick={() => jump(-1)}><ChevronUp size={14} /></button>
-        <button title="Hunk siguiente" className="rounded p-1 text-gray-400 hover:bg-elev hover:text-amber" onClick={() => jump(1)}><ChevronDown size={14} /></button>
-        <span className="text-gray-500">{total > 0 ? `${Math.min(cur + 1, total)}/${total}` : "0/0"}</span>
-        <div className="flex overflow-hidden rounded border border-line">
-          <button className={`px-2 py-0.5 ${mode === "unified" ? "bg-elev text-amber" : "text-gray-400"}`} onClick={() => setMode("unified")} title="Unified"><Rows2 size={13} /></button>
-          <button className={`px-2 py-0.5 ${mode === "split" ? "bg-elev text-amber" : "text-gray-400"}`} onClick={() => setMode("split")} title="Split"><Columns2 size={13} /></button>
-        </div>
+        {diff.path.toLowerCase().endsWith(".svg") && body === "diff" && (
+          <button className={tbtn} onClick={() => setSvgText((v) => !v)}>{svgText ? "Imagen" : "Texto"}</button>
+        )}
+        {body === "diff" && canView && <button className={tbtn} onClick={() => void loadFile("file")}><Eye size={12} /> View file</button>}
+        {body === "diff" && canEdit && <button className={tbtn} onClick={() => void loadFile("edit")}><Pencil size={12} /> Edit</button>}
+        {body !== "diff" && <button className={tbtn} onClick={() => void closeBody()}>Volver al diff</button>}
+        {onClose && <button title="Cerrar (Esc)" className={tbtn} onClick={onClose}><X size={13} /></button>}
       </div>
-      {diff.binary ? (
-        <EmptyState art="diff" title="Archivo binario" hint="Sin vista de diff." />
-      ) : total === 0 ? (
+      {body !== "diff" ? (
+        fileText === null ? <DiffSkeleton /> : (
+          <div data-edit-host className="flex min-h-0 flex-1 flex-col">
+            <CodeView path={diff.path} text={fileText} editable={body === "edit"} onSave={(c) => void save(c)}
+              onDirty={(d) => setDirty(d)} getDoc={docGetter} />
+          </div>
+        )
+      ) : showImage ? (
+        <div className="min-h-0 flex-1"><ImageDiff revs={imageRevs} /></div>
+      ) : diff.binary ? (
+        <EmptyState art="diff" title="Archivo binario" hint="Sin vista de diff para este tipo de archivo." />
+      ) : diff.hunks.length === 0 ? (
         <EmptyState art="diff" title="Sin cambios que mostrar" />
       ) : (
         <div ref={host} className="min-h-0 flex-1 overflow-auto" />

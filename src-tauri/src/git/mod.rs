@@ -5,3 +5,5 @@ pub mod graph_engine;
 pub mod models;
 pub mod parsers;
 pub mod patcher;
+pub mod ext_a;
+pub mod ext_b;

@@ -29,7 +29,8 @@ pub fn parse_status(out: &str) -> RepoStatus {
             if let Some(v) = h.strip_prefix("branch.oid ") {
                 st.head_sha = if v == "(initial)" { None } else { Some(v.to_string()) };
             } else if let Some(v) = h.strip_prefix("branch.head ") {
-                st.branch = if v == "(detached)" { None } else { Some(v.to_string()) };
+                st.detached = v == "(detached)";
+                st.branch = if st.detached { None } else { Some(v.to_string()) };
             } else if let Some(v) = h.strip_prefix("branch.upstream ") {
                 st.upstream = Some(v.to_string());
             } else if let Some(v) = h.strip_prefix("branch.ab ") {
@@ -364,14 +365,14 @@ pub fn parse_diff(out: &str) -> Vec<DiffFile> {
         let Some(h) = hunk.as_mut() else { continue };
         if let Some(c) = line.strip_prefix('+') {
             f.additions += 1;
-            h.lines.push(DiffLine { kind: "add".into(), content: c.to_string(), old_no: None, new_no: Some(new_no) });
+            h.lines.push(DiffLine { kind: "add".into(), content: c.to_string(), old_no: None, new_no: Some(new_no), words: None });
             new_no += 1;
         } else if let Some(c) = line.strip_prefix('-') {
             f.deletions += 1;
-            h.lines.push(DiffLine { kind: "del".into(), content: c.to_string(), old_no: Some(old_no), new_no: None });
+            h.lines.push(DiffLine { kind: "del".into(), content: c.to_string(), old_no: Some(old_no), new_no: None, words: None });
             old_no += 1;
         } else if let Some(c) = line.strip_prefix(' ') {
-            h.lines.push(DiffLine { kind: "ctx".into(), content: c.to_string(), old_no: Some(old_no), new_no: Some(new_no) });
+            h.lines.push(DiffLine { kind: "ctx".into(), content: c.to_string(), old_no: Some(old_no), new_no: Some(new_no), words: None });
             old_no += 1;
             new_no += 1;
         }
@@ -382,6 +383,123 @@ pub fn parse_diff(out: &str) -> Vec<DiffFile> {
         files.push(f);
     }
     files
+}
+
+fn tokenize(s: &str) -> Vec<&str> {
+    #[derive(PartialEq, Clone, Copy)]
+    enum K {
+        Word,
+        Space,
+        Other,
+    }
+    let kind = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            K::Word
+        } else if c.is_whitespace() {
+            K::Space
+        } else {
+            K::Other
+        }
+    };
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut prev: Option<K> = None;
+    for (i, c) in s.char_indices() {
+        let k = kind(c);
+        if let Some(p) = prev {
+            if p != k || k == K::Other {
+                out.push(&s[start..i]);
+                start = i;
+            }
+        }
+        prev = Some(k);
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+fn push_seg(out: &mut Vec<DiffWord>, text: &str, changed: bool) {
+    if let Some(l) = out.last_mut() {
+        if l.changed == changed {
+            l.text.push_str(text);
+            return;
+        }
+    }
+    out.push(DiffWord { text: text.to_string(), changed });
+}
+
+/// Diff por palabras entre dos líneas: (segmentos de la antigua, segmentos de la nueva).
+pub fn word_segments(old: &str, new: &str) -> Option<(Vec<DiffWord>, Vec<DiffWord>)> {
+    let a = tokenize(old);
+    let b = tokenize(new);
+    if a.len().saturating_mul(b.len()) > 2_000_000 {
+        return None;
+    }
+    let (n, m) = (a.len(), b.len());
+    let mut dp = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[at(i, j)] = if a[i] == b[j] { dp[at(i + 1, j + 1)] + 1 } else { dp[at(i + 1, j)].max(dp[at(i, j + 1)]) };
+        }
+    }
+    let (mut ra, mut rb) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            push_seg(&mut ra, a[i], false);
+            push_seg(&mut rb, b[j], false);
+            i += 1;
+            j += 1;
+        } else if dp[at(i + 1, j)] >= dp[at(i, j + 1)] {
+            push_seg(&mut ra, a[i], true);
+            i += 1;
+        } else {
+            push_seg(&mut rb, b[j], true);
+            j += 1;
+        }
+    }
+    while i < n {
+        push_seg(&mut ra, a[i], true);
+        i += 1;
+    }
+    while j < m {
+        push_seg(&mut rb, b[j], true);
+        j += 1;
+    }
+    Some((ra, rb))
+}
+
+/// Rellena `DiffLine.words` empareando las líneas del/add consecutivas de cada hunk.
+pub fn apply_word_diff(files: &mut [DiffFile]) {
+    for f in files {
+        for h in &mut f.hunks {
+            let mut i = 0;
+            while i < h.lines.len() {
+                if h.lines[i].kind != "del" {
+                    i += 1;
+                    continue;
+                }
+                let ds = i;
+                while i < h.lines.len() && h.lines[i].kind == "del" {
+                    i += 1;
+                }
+                let de = i;
+                while i < h.lines.len() && h.lines[i].kind == "add" {
+                    i += 1;
+                }
+                let pairs = (de - ds).min(i - de);
+                for k in 0..pairs {
+                    if let Some((wo, wn)) = word_segments(&h.lines[ds + k].content, &h.lines[de + k].content) {
+                        h.lines[ds + k].words = Some(wo);
+                        h.lines[de + k].words = Some(wn);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Parsea `git blame --porcelain`.
@@ -529,5 +647,27 @@ u UU N... 100644 100644 100644 100644 a b c conflict.txt\0\
         assert!(detect_operation(d.path()).is_none());
         std::fs::write(d.path().join("MERGE_HEAD"), "x").unwrap();
         assert_eq!(detect_operation(d.path()).as_deref(), Some("merge"));
+    }
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    #[test]
+    fn palabras() {
+        let (o, n) = word_segments("let x = foo(1);", "let x = bar(1);").unwrap();
+        assert_eq!(o.iter().filter(|w| w.changed).map(|w| w.text.as_str()).collect::<String>(), "foo");
+        assert_eq!(n.iter().filter(|w| w.changed).map(|w| w.text.as_str()).collect::<String>(), "bar");
+        assert_eq!(o.iter().map(|w| w.text.as_str()).collect::<String>(), "let x = foo(1);");
+    }
+
+    #[test]
+    fn empareja_lineas() {
+        let mut files = parse_diff("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-uno dos\n-tres\n+uno DOS\n+tres\n");
+        apply_word_diff(&mut files);
+        let l = &files[0].hunks[0].lines;
+        assert!(l[0].words.as_ref().unwrap().iter().any(|w| w.changed));
+        assert!(l[3].words.as_ref().unwrap().iter().all(|w| !w.changed));
     }
 }

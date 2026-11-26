@@ -5,15 +5,18 @@
 :root {
   font-family: Inter, system-ui, sans-serif;
   color-scheme: dark;
-  /* valores de respaldo (Graphite & Amber); applyTheme() los sobrescribe al arrancar */
-  --c-app: 13 14 17; --c-panel: 19 21 26; --c-elev: 26 29 36; --c-line: 38 42 52; --c-text: 229 231 235;
-  --c-gray-50: 229 231 235; --c-gray-100: 229 231 235; --c-gray-200: 207 209 214; --c-gray-300: 172 175 182;
-  --c-gray-400: 135 138 146; --c-gray-500: 100 103 111; --c-gray-600: 70 73 82;
-  --c-accent: 245 158 11; --c-accent-hover: 196 126 9; --c-accent-soft: 248 189 79; --c-on-accent: 11 11 12;
-  --c-git-added: 16 185 129; --c-git-modified: 245 158 11; --c-git-deleted: 239 68 68; --c-git-renamed: 59 130 246; --c-git-conflict: 244 63 94;
-  --c-sky: 120 205 250; --c-emerald: 100 220 180; --c-red: 250 130 130; --c-scrim: 0 0 0;
-  --lane-0: 245 158 11; --lane-1: 56 189 248; --lane-2: 16 185 129; --lane-3: 167 139 250;
-  --lane-4: 251 113 133; --lane-5: 45 212 191; --lane-6: 251 191 36; --lane-7: 129 140 248;
+  /* valores de respaldo (GitKraken Dark); applyTheme() los sobrescribe al arrancar */
+  --c-app: 27 31 39; --c-panel: 35 41 51; --c-elev: 43 50 64; --c-line: 52 60 75; --c-text: 217 222 231;
+  --c-gray-50: 217 222 231; --c-gray-100: 217 222 231; --c-gray-200: 196 201 210; --c-gray-300: 165 171 182;
+  --c-gray-400: 135 142 155; --c-gray-500: 106 113 127; --c-gray-600: 80 87 100;
+  --c-accent: 0 199 160; --c-accent-hover: 0 159 128; --c-accent-soft: 64 214 183; --c-on-accent: 11 11 12;
+  --c-git-added: 63 209 124; --c-git-modified: 245 165 36; --c-git-deleted: 240 85 106; --c-git-renamed: 77 163 255; --c-git-conflict: 255 92 138;
+  --c-sky: 140 195 255; --c-emerald: 130 225 170; --c-red: 245 140 150; --c-scrim: 0 0 0;
+  --lane-0: 0 199 160; --lane-1: 77 163 255; --lane-2: 245 165 36; --lane-3: 176 124 255; --lane-4: 255 92 138;
+  --lane-5: 240 85 106; --lane-6: 63 209 124; --lane-7: 255 138 61; --lane-8: 34 211 238; --lane-9: 229 208 79;
+  /* densidad estilo GitKraken */
+  --h-tab: 36px; --h-toolbar: 44px; --h-row: 27px; --h-status: 24px;
+  font-size: 13px;
 }
 
 html,
@@ -26,7 +29,12 @@ body,
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
-body { letter-spacing: -0.003em; }
+body { letter-spacing: -0.003em; font-size: 13px; }
+
+/* selección = acento 18 % + borde izquierdo 2 px; hover = +4 % de luz */
+.row-selected { background: rgb(var(--c-accent) / .18); box-shadow: inset 2px 0 0 rgb(var(--c-accent)); }
+.row-hover:hover:not(.row-selected) { background: rgb(var(--c-text) / .04); }
+.row-h { height: var(--h-row); }
 
 code,
 pre,

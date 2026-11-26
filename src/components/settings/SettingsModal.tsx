@@ -4,7 +4,7 @@ import { THEMES, resolveTheme } from "../../lib/themes";
 import { useUpdater } from "../../lib/updater";
 import { usePrefs, useSettingsUi } from "../../store/usePrefs";
 
-function Swatch({ id }: { id: string }) {
+export function Swatch({ id }: { id: string }) {
   const t = resolveTheme(id);
   const custom = usePrefs((s) => s.accent);
   const cur = usePrefs((s) => s.themeId);

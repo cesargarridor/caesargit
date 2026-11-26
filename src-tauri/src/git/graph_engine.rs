@@ -199,28 +199,111 @@ struct Cache {
 }
 static CACHE: Lazy<Mutex<HashMap<PathBuf, Cache>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-async fn cache_key(repo: &Path) -> Result<String> {
-    // Clave de invalidación: todos los refs + HEAD.
-    let refs = executor::read(repo, &["for-each-ref", "--format=%(objectname) %(refname)"]).await?;
-    let head = executor::read(repo, &["rev-parse", "-q", "--verify", "HEAD"]).await.unwrap_or_default();
-    Ok(format!("{}\n{}", head.trim(), refs))
+/// Filtros opcionales del grafo (ya validados por el comando).
+#[derive(Debug, Clone, Default)]
+pub struct GraphFilter {
+    pub include_refs: Vec<String>,
+    pub exclude_refs: Vec<String>,
+    pub author: Option<String>,
+    /// Ruta relativa ya validada (`path_guard::safe_rel`).
+    pub path: Option<String>,
+    pub grep: Option<String>,
+    pub since: Option<String>,
+    /// ('S' | 'G', texto)
+    pub pickaxe: Option<(char, String)>,
+    pub include_stashes: bool,
 }
 
-async fn log_slice(repo: &Path, skip: u32, count: u32) -> Result<Vec<CommitNode>> {
+impl GraphFilter {
+    /// Con estos filtros git no reescribe padres: se dibujan nodos sueltos.
+    fn strips_parents(&self) -> bool {
+        self.author.is_some() || self.grep.is_some() || self.since.is_some() || self.pickaxe.is_some()
+    }
+}
+
+async fn stash_shas(repo: &Path) -> Vec<String> {
+    executor::read(repo, &["stash", "list", "--format=%H"])
+        .await
+        .map(|o| o.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+async fn cache_key(repo: &Path, f: &GraphFilter, stashes: &[String]) -> Result<String> {
+    // Clave de invalidación: todos los refs + HEAD + filtros + stashes.
+    let refs = executor::read(repo, &["for-each-ref", "--format=%(objectname) %(refname)"]).await?;
+    let head = executor::read(repo, &["rev-parse", "-q", "--verify", "HEAD"]).await.unwrap_or_default();
+    Ok(format!("{}\n{}\n{:?}\n{}", head.trim(), refs, f, stashes.join(",")))
+}
+
+/// Devuelve (commits tras ocultar los internos de stash, número de commits crudos leídos).
+async fn log_slice(repo: &Path, skip: u32, count: u32, f: &GraphFilter, stashes: &[String]) -> Result<(Vec<CommitNode>, u32)> {
     let skip_a = format!("--skip={skip}");
     let max_a = format!("--max-count={count}");
-    let raw = executor::read(
-        repo,
-        &["log", "--all", "--topo-order", "--parents", "--decorate=short", LOG_FORMAT, &skip_a, &max_a],
-    )
-    .await?;
-    Ok(parse_log(&raw))
+    let mut args: Vec<String> =
+        vec!["log".into(), "--topo-order".into(), "--parents".into(), "--decorate=short".into(), LOG_FORMAT.into(), skip_a, max_a];
+    if f.include_refs.is_empty() {
+        // Los stashes solo salen como nodos propios (`include_stashes`), nunca con sus commits internos.
+        args.push("--exclude=refs/stash".into());
+        for n in &f.exclude_refs {
+            for pre in ["refs/heads/", "refs/remotes/", "refs/tags/"] {
+                args.push(format!("--exclude={pre}{n}"));
+            }
+        }
+        args.push("--all".into());
+    } else {
+        args.extend(f.include_refs.iter().cloned());
+    }
+    if f.include_stashes {
+        args.extend(stashes.iter().cloned());
+    }
+    if let Some(a) = &f.author {
+        args.push(format!("--author={a}"));
+    }
+    if let Some(g) = &f.grep {
+        args.extend(["-i".into(), "--fixed-strings".into(), format!("--grep={g}")]);
+    }
+    if let Some(s) = &f.since {
+        args.push(format!("--since={s}"));
+    }
+    if let Some((m, t)) = &f.pickaxe {
+        args.push(format!("-{m}{t}"));
+    }
+    if let Some(p) = &f.path {
+        args.push("--".into());
+        args.push(p.clone());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let raw = executor::read(repo, &refs).await?;
+    let mut commits = parse_log(&raw);
+    let n_raw = commits.len() as u32;
+    if f.strips_parents() {
+        for c in &mut commits {
+            c.parents.clear();
+        }
+    }
+    if f.include_stashes && !stashes.is_empty() {
+        let mut internal = std::collections::HashSet::new();
+        for c in &commits {
+            if stashes.contains(&c.sha) {
+                internal.extend(c.parents.iter().skip(1).cloned());
+            }
+        }
+        commits.retain(|c| !internal.contains(&c.sha));
+        for c in &mut commits {
+            if let Some(i) = stashes.iter().position(|s| *s == c.sha) {
+                c.parents.truncate(1);
+                c.refs.push(RefLabel { name: format!("stash@{{{i}}}"), kind: "stash".into() });
+            }
+        }
+    }
+    Ok((commits, n_raw))
 }
 
 /// Página del grafo. Reutiliza el estado de carriles cacheado del cursor si existe;
-/// si no, recomputa desde 0 hasta cursor.
-pub async fn get_graph(repo: &Path, cursor: u32, limit: u32, has_wip: bool) -> Result<GraphPage> {
-    let key = cache_key(repo).await?;
+/// si no, recomputa desde 0 hasta cursor. `cursor`/`next_cursor` cuentan commits crudos de git.
+pub async fn get_graph(repo: &Path, cursor: u32, limit: u32, has_wip: bool, filter: &GraphFilter) -> Result<GraphPage> {
+    let stashes = if filter.include_stashes { stash_shas(repo).await } else { Vec::new() };
+    let key = cache_key(repo, filter, &stashes).await?;
     let mut state = {
         let mut c = CACHE.lock().unwrap();
         let e = c.entry(repo.to_path_buf()).or_insert_with(|| Cache { key: key.clone(), states: HashMap::new() });
@@ -233,25 +316,26 @@ pub async fn get_graph(repo: &Path, cursor: u32, limit: u32, has_wip: bool) -> R
     if state.is_none() {
         let mut st = LaneState::default();
         if cursor > 0 {
-            let prev = log_slice(repo, 0, cursor).await?;
+            let (prev, _) = log_slice(repo, 0, cursor, filter, &stashes).await?;
             compute_rows(&prev, &mut st);
         }
         state = Some(st);
     }
     let mut st = state.unwrap();
-    let commits = log_slice(repo, cursor, limit).await?;
+    let (commits, n_raw) = log_slice(repo, cursor, limit, filter, &stashes).await?;
     let rows = compute_rows(&commits, &mut st);
-    let n = rows.len() as u32;
     {
         let mut c = CACHE.lock().unwrap();
         if let Some(e) = c.get_mut(repo) {
             if e.key == key {
-                e.states.insert(cursor + n, st);
+                e.states.insert(cursor + n_raw, st);
             }
         }
     }
     let head = executor::read(repo, &["rev-parse", "-q", "--verify", "HEAD"]).await.ok();
-    Ok(make_page(rows, cursor, limit, head.as_deref().map(str::trim), has_wip))
+    let mut page = make_page(rows, cursor, limit, head.as_deref().map(str::trim), has_wip);
+    page.next_cursor = if n_raw >= limit && limit > 0 { Some(cursor + n_raw) } else { None };
+    Ok(page)
 }
 
 #[cfg(test)]
@@ -369,10 +453,10 @@ mod tests {
         for i in 0..3 {
             g(&["commit", "-q", "--allow-empty", "-m", &format!("c{i}")]);
         }
-        let page = get_graph(p, 0, 2, true).await.unwrap();
+        let page = get_graph(p, 0, 2, true, &GraphFilter::default()).await.unwrap();
         assert_eq!(page.rows.len(), 3); // WIP + 2
         assert_eq!(page.next_cursor, Some(2));
-        let page2 = get_graph(p, 2, 2, false).await.unwrap();
+        let page2 = get_graph(p, 2, 2, false, &GraphFilter::default()).await.unwrap();
         assert_eq!(page2.rows.len(), 1);
         assert_eq!(page2.next_cursor, None);
     }

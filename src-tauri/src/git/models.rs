@@ -20,6 +20,12 @@ pub struct RepoStatus {
     pub files: Vec<FileChange>,
     /// "merge" | "rebase" | "cherry-pick" | "revert"
     pub operation: Option<String>,
+    /// HEAD desacoplado (sin rama).
+    #[serde(default)]
+    pub detached: bool,
+    /// Nombre del worktree enlazado (None en el worktree principal).
+    #[serde(default)]
+    pub worktree_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +158,16 @@ pub struct DiffLine {
     pub content: String,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
+    /// Segmentos intra-línea (solo si `wordDiff`): en líneas add/del emparejadas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<DiffWord>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffWord {
+    pub text: String,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,4 +209,86 @@ pub struct RebaseTodoItem {
     pub sha: String,
     pub subject: String,
     pub new_message: Option<String>,
+}
+
+// ---------------------------------------------------------------- extendidos (R1)
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoState {
+    pub undo_label: Option<String>,
+    pub redo_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteInfo {
+    pub name: String,
+    pub fetch_url: String,
+    pub push_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorInfo {
+    pub name: String,
+    pub email: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobData {
+    pub base64: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigEntry {
+    pub key: String,
+    /// Valor en `.git/config` del repo.
+    pub local: Option<String>,
+    /// Valor efectivo (local, global o sistema).
+    pub effective: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitTemplate {
+    pub summary: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEntry {
+    pub id: u64,
+    /// Milisegundos desde epoch (inicio del comando).
+    pub timestamp_ms: i64,
+    pub repo: String,
+    /// "read" | "write"
+    pub kind: String,
+    /// Comando sanitizado: `git log --all ...`.
+    pub command: String,
+    pub ok: bool,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitProgress {
+    pub repo_path: Option<String>,
+    pub op: String,
+    pub percent: u32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitTemplates {
+    pub gitignore: Vec<String>,
+    pub licenses: Vec<String>,
 }

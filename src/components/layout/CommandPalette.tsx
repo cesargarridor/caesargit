@@ -37,12 +37,18 @@ export function CommandPalette() {
     const out: Item[] = [];
     const act = (id: string, label: string, run: () => void, hint?: string) =>
       out.push({ id, group: "Acciones", label, hint, icon: <Zap size={13} />, run });
-    act("open", "Abrir repositorio…", () => void s.pickAndOpen(), "⌘O");
+    act("open", "Abrir repositorio…", () => void s.pickAndOpen(), "⌘⇧O");
+    act("newtab", "Nueva pestaña", () => s.setNewTabOpen(true), "⌘T");
+    act("clone", "Clonar repositorio…", () => s.setModal({ kind: "clone" }));
+    act("init", "Inicializar repositorio…", () => s.setModal({ kind: "init" }));
+    act("prefs", "Preferencias", () => s.setModal({ kind: "preferences" }), "⌘,");
+    act("shortcuts", "Atajos de teclado", () => s.setModal({ kind: "shortcuts" }), "⌘/");
+    act("activity", "Registro de actividad", () => s.setModal({ kind: "activity" }));
     if (tab) {
       act("fetch", "Fetch", () => void gitActions.fetch(false, false));
       act("fetchall", "Fetch All", () => void gitActions.fetch(true, false));
       act("prune", "Fetch & Prune", () => void gitActions.fetch(true, true));
-      act("pull", "Pull (fast-forward)", () => void gitActions.pull("ff"));
+      act("pull", "Pull (solo fast-forward)", () => void gitActions.pull("ff"));
       act("pullr", "Pull (rebase)", () => void gitActions.pull("rebase"));
       act("pullm", "Pull (merge)", () => void gitActions.pull("merge"));
       act("push", "Push", () => void gitActions.push(false));
@@ -50,7 +56,18 @@ export function CommandPalette() {
       act("branch", "Nueva rama desde HEAD…", () => void gitActions.createBranch());
       act("stash", "Stash", () => void gitActions.stash());
       act("pop", "Pop stash", () => void gitActions.popStash());
-      act("undo", "Deshacer último commit", () => void gitActions.undo());
+      act("undo", s.undoState.undoLabel ? `Deshacer: ${s.undoState.undoLabel}` : "Deshacer", () => void gitActions.undo(), "⌘Z");
+      act("redo", s.undoState.redoLabel ? `Rehacer: ${s.undoState.redoLabel}` : "Rehacer", () => void gitActions.redo(), "⌘⇧Z");
+      act("remotes", "Remotos…", () => s.setModal({ kind: "remotes" }));
+      act("reflog", "Reflog…", () => s.setModal({ kind: "reflog" }));
+      act("patch", "Parches (crear / aplicar)…", () => s.setModal({ kind: "patch" }));
+      act("submodules", "Submódulos…", () => s.setModal({ kind: "submodules" }));
+      act("worktrees", "Worktrees…", () => s.setModal({ kind: "worktrees" }));
+      act("lfs", "Git LFS…", () => s.setModal({ kind: "lfs" }));
+      act("gitflow", "Gitflow…", () => s.setModal({ kind: "gitflow" }));
+      act("hooks", "Git hooks…", () => s.setModal({ kind: "hooks" }));
+      act("bisect", "Bisect…", () => s.setModal({ kind: "bisect" }));
+      act("repoSettings", "Ajustes del repositorio…", () => s.setModal({ kind: "repoSettings" }));
       act("refresh", "Refrescar", () => void s.refresh());
       act("close", "Cerrar pestaña", () => void s.closeTab(tab.info.id), "⌘W");
       for (const b of tab.branches.filter((x) => !x.isRemote))
