@@ -1695,6 +1695,8 @@ mod tests {
         assert_eq!(cfg.iter().find(|e| e.key == "user.signingkey").unwrap().local.as_deref(), Some("-x"));
         set_repo_config(p.clone(), "user.name".into(), None).await.unwrap();
         set_repo_config(p.clone(), "user.name".into(), None).await.unwrap();
+        // En CI no hay identidad global: la restauramos para los commits siguientes.
+        sh(d, &["config", "user.name", "Test"]);
         assert!(set_repo_config(p.clone(), "core.sshCommand".into(), Some("touch x".into())).await.is_err());
         assert!(set_repo_config(p.clone(), "gpg.format".into(), Some("raro".into())).await.is_err());
         // plantilla

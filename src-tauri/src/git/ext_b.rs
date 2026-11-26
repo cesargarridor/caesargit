@@ -120,9 +120,16 @@ async fn bisect_state(root: &Path, message: String) -> Result<BisectStatus> {
     let current = executor::read(root, &["rev-parse", "HEAD"]).await.ok().map(|s| s.trim().to_string());
     let log: Vec<String> =
         executor::read(root, &["bisect", "log"]).await.unwrap_or_default().lines().map(str::to_string).collect();
-    let first_bad = log.iter().find_map(|l| {
-        l.strip_prefix("# first bad commit: [").and_then(|r| r.split(']').next()).map(str::to_string)
-    });
+    let first_bad = log
+        .iter()
+        .find_map(|l| l.strip_prefix("# first bad commit: [").and_then(|r| r.split(']').next()).map(str::to_string))
+        .or_else(|| {
+            // Git antiguo: el log no trae la línea; la salida del comando sí («<sha> is the first bad commit»).
+            message.lines().find_map(|l| {
+                let sha = l.strip_suffix(" is the first bad commit")?.trim();
+                (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+            })
+        });
     let mut remaining = None;
     if executor::read(root, &["rev-parse", "--verify", "--quiet", "refs/bisect/bad"]).await.is_ok() {
         let goods = executor::read(root, &["for-each-ref", "--format=%(refname)", "refs/bisect/"]).await.unwrap_or_default();
