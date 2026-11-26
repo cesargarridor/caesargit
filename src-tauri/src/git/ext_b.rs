@@ -120,7 +120,7 @@ async fn bisect_state(root: &Path, message: String) -> Result<BisectStatus> {
     let current = executor::read(root, &["rev-parse", "HEAD"]).await.ok().map(|s| s.trim().to_string());
     let log: Vec<String> =
         executor::read(root, &["bisect", "log"]).await.unwrap_or_default().lines().map(str::to_string).collect();
-    let first_bad = log
+    let mut first_bad = log
         .iter()
         .find_map(|l| l.strip_prefix("# first bad commit: [").and_then(|r| r.split(']').next()).map(str::to_string))
         .or_else(|| {
@@ -140,6 +140,10 @@ async fn bisect_state(root: &Path, message: String) -> Result<BisectStatus> {
             args.extend(good_refs);
         }
         remaining = executor::read(root, &args).await.ok().and_then(|s| s.trim().parse().ok());
+        // Solo queda el propio «bad» por descartar: ese es el primer commit malo (vale para cualquier versión de git).
+        if first_bad.is_none() && remaining == Some(1) {
+            first_bad = executor::read(root, &["rev-parse", "refs/bisect/bad"]).await.ok().map(|s| s.trim().to_string());
+        }
     }
     Ok(BisectStatus { active: true, current, remaining, log, first_bad, message })
 }
