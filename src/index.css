@@ -15,9 +15,11 @@
   --lane-0: 0 199 160; --lane-1: 77 163 255; --lane-2: 245 165 36; --lane-3: 176 124 255; --lane-4: 255 92 138;
   --lane-5: 240 85 106; --lane-6: 63 209 124; --lane-7: 255 138 61; --lane-8: 34 211 238; --lane-9: 229 208 79;
   /* densidad estilo GitKraken */
-  --h-tab: 36px; --h-toolbar: 44px; --h-row: 27px; --h-status: 24px;
+  --h-tab: 44px; --h-toolbar: 48px; --h-row: 28px; --h-status: 28px;
   font-size: 13px;
+  --safe-top: 0px;
 }
+html.is-mac { --safe-top: 36px; }
 
 html,
 body,

@@ -4,6 +4,7 @@ import App from "./App";
 import { applyTheme } from "./lib/themes";
 import { usePrefs } from "./store/usePrefs";
 import "./index.css";
+if (/Mac/i.test(navigator.platform)) document.documentElement.classList.add("is-mac");
 
 // Aplica el tema antes de pintar y cada vez que cambia
 let last = { themeId: "", accent: null as string | null };

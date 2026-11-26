@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-mergetool"
+description = "Enables the run_mergetool command without any pre-configured scope."
+commands.allow = ["run_mergetool"]
+
+[[permission]]
+identifier = "deny-run-mergetool"
+description = "Denies the run_mergetool command without any pre-configured scope."
+commands.deny = ["run_mergetool"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-redo-action"
+description = "Enables the redo_action command without any pre-configured scope."
+commands.allow = ["redo_action"]
+
+[[permission]]
+identifier = "deny-redo-action"
+description = "Denies the redo_action command without any pre-configured scope."
+commands.deny = ["redo_action"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-difftool"
+description = "Enables the run_difftool command without any pre-configured scope."
+commands.allow = ["run_difftool"]
+
+[[permission]]
+identifier = "deny-run-difftool"
+description = "Denies the run_difftool command without any pre-configured scope."
+commands.deny = ["run_difftool"]

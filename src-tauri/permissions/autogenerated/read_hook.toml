@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-hook"
+description = "Enables the read_hook command without any pre-configured scope."
+commands.allow = ["read_hook"]
+
+[[permission]]
+identifier = "deny-read-hook"
+description = "Denies the read_hook command without any pre-configured scope."
+commands.deny = ["read_hook"]

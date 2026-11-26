@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-apply-lines"
+description = "Enables the apply_lines command without any pre-configured scope."
+commands.allow = ["apply_lines"]
+
+[[permission]]
+identifier = "deny-apply-lines"
+description = "Denies the apply_lines command without any pre-configured scope."
+commands.deny = ["apply_lines"]

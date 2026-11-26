@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ignore-path"
+description = "Enables the ignore_path command without any pre-configured scope."
+commands.allow = ["ignore_path"]
+
+[[permission]]
+identifier = "deny-ignore-path"
+description = "Denies the ignore_path command without any pre-configured scope."
+commands.deny = ["ignore_path"]

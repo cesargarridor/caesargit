@@ -15,7 +15,7 @@ use once_cell::sync::Lazy;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{AppHandle, Emitter};
 
 // ================================================================ Undo / Redo
@@ -28,7 +28,21 @@ struct Snapshot {
     stashes: Vec<(String, String)>,
     itree: Option<String>,
     wtree: String,
+    /// Directorio de objetos temporal donde viven los blobs/árboles de `wtree` (ver `worktree_tree`).
+    /// No participa en la comparación: dos snapshots con el mismo `wtree` son iguales.
+    objdir: Option<ObjDir>,
 }
+
+/// Directorio temporal de objetos del snapshot. Se borra al descartarse la entrada de undo/redo.
+#[derive(Debug, Clone)]
+struct ObjDir(Arc<tempfile::TempDir>);
+
+impl PartialEq for ObjDir {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for ObjDir {}
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -81,21 +95,49 @@ async fn list_stashes_raw(root: &Path) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Entorno para que git escriba objetos nuevos en `objdir` (temporal) y lea los del repo real
+/// como alternate. `real_objects` es el directorio de objetos real.
+fn objdir_envs(objdir: &Path, real_objects: &Path) -> Vec<(String, String)> {
+    vec![
+        ("GIT_OBJECT_DIRECTORY".into(), objdir.to_string_lossy().into_owned()),
+        ("GIT_ALTERNATE_OBJECT_DIRECTORIES".into(), real_objects.to_string_lossy().into_owned()),
+    ]
+}
+
+/// Directorio de objetos real del repo (respeta worktrees enlazados).
+async fn real_objects_dir(root: &Path) -> Result<PathBuf> {
+    let out = executor::read(root, &["rev-parse", "--path-format=absolute", "--git-path", "objects"]).await?;
+    Ok(PathBuf::from(out.trim_end_matches(['\n', '\r'])))
+}
+
 /// Árbol del working tree completo (incluye archivos sin seguimiento, respeta .gitignore)
 /// construido con un índice temporal: no toca el índice real.
-async fn worktree_tree(root: &Path) -> Result<String> {
+///
+/// Seguridad (auditoría M-03): `git add -A` escribe el contenido de TODOS los archivos sin
+/// seguimiento (`.env` sin ignorar, claves, volcados...) como objetos en `.git/objects`, donde
+/// persisten semanas y viajan con cualquier copia de `.git`. Para evitarlo los objetos nuevos se
+/// escriben en un directorio temporal (`GIT_OBJECT_DIRECTORY`), con el real como alternate de solo
+/// lectura. El directorio vive mientras viva la entrada de undo/redo (en memoria) y se borra
+/// después. Compromiso: los snapshots no sobreviven a cerrar la app (ya era así: la pila es en
+/// memoria) y los archivos grandes sin seguimiento ocupan espacio temporal mientras estén en la pila.
+async fn worktree_tree(root: &Path) -> Result<(String, ObjDir)> {
     let gd = executor::git_dir(root).await?;
+    let real_objects = real_objects_dir(root).await?;
     let td = tempfile::tempdir()?;
     let idx = td.path().join("index");
     let real = gd.join("index");
     if real.exists() {
         std::fs::copy(&real, &idx)?;
     }
+    let objs = tempfile::tempdir()?;
     let idx_s = idx.to_string_lossy().into_owned();
-    let envs = [("GIT_INDEX_FILE", idx_s.as_str())];
+    let mut owned = objdir_envs(objs.path(), &real_objects);
+    owned.push(("GIT_INDEX_FILE".into(), idx_s));
+    let envs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     executor::read_env(root, &["add", "-A"], &envs).await?;
     let t = executor::read_env(root, &["write-tree"], &envs).await?;
-    trimmed(t).ok_or_else(|| AppError::git_failed("write-tree vacío"))
+    let t = trimmed(t).ok_or_else(|| AppError::git_failed("write-tree vacío"))?;
+    Ok((t, ObjDir(Arc::new(objs))))
 }
 
 async fn snapshot(root: &Path) -> Result<Snapshot> {
@@ -104,8 +146,8 @@ async fn snapshot(root: &Path) -> Result<Snapshot> {
     let refs = list_refs(root).await?;
     let stashes = list_stashes_raw(root).await;
     let itree = executor::read(root, &["write-tree"]).await.ok().and_then(trimmed);
-    let wtree = worktree_tree(root).await?;
-    Ok(Snapshot { head_ref, head_sha, refs, stashes, itree, wtree })
+    let (wtree, objdir) = worktree_tree(root).await?;
+    Ok(Snapshot { head_ref, head_sha, refs, stashes, itree, wtree, objdir: Some(objdir) })
 }
 
 async fn restore_stashes(root: &Path, want: &[(String, String)]) -> Result<()> {
@@ -148,7 +190,13 @@ async fn restore(root: &Path, snap: &Snapshot) -> Result<()> {
             executor::write(root, &["update-ref", "-d", name]).await?;
         }
     }
-    executor::write(root, &["read-tree", "--reset", "-u", &snap.wtree]).await?;
+    // El árbol del working tree vive en el directorio temporal del snapshot (ver `worktree_tree`).
+    let mut owned: Vec<(String, String)> = Vec::new();
+    if let Some(od) = &snap.objdir {
+        owned = objdir_envs(od.0.path(), &real_objects_dir(root).await?);
+    }
+    let envs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    executor::write_env(root, &["read-tree", "--reset", "-u", &snap.wtree], &envs).await?;
     if let Some(it) = &snap.itree {
         executor::write(root, &["read-tree", "--reset", it]).await?;
     }
@@ -245,27 +293,13 @@ fn mime_of(path: &str) -> &'static str {
     }
 }
 
-/// Oculta credenciales embebidas (`https://user:pass@host`) en una URL.
+/// Oculta credenciales embebidas (usuario, `usuario:clave` o token como usuario) en una URL.
 fn mask_url(u: &str) -> String {
-    if let Some(i) = u.find("://") {
-        let rest = &u[i + 3..];
-        if let Some(at) = rest.find('@') {
-            let slash = rest.find('/').unwrap_or(rest.len());
-            if at < slash {
-                let user = rest[..at].split(':').next().unwrap_or("");
-                return format!("{}://{}@{}", &u[..i], user, &rest[at + 1..]);
-            }
-        }
-    }
-    u.to_string()
+    executor::mask_credentials(u)
 }
 
-/// Impide tocar `.git` (hooks, config) desde lectura/escritura de archivos.
 fn reject_dot_git(rel: &Path) -> Result<()> {
-    if rel.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")) {
-        return Err(AppError::invalid_path("no se permite acceder a .git"));
-    }
-    Ok(())
+    path_guard::reject_dot_git(rel)
 }
 
 async fn rel_inside(root: &Path, path: &str) -> Result<(String, PathBuf)> {
@@ -312,7 +346,7 @@ async fn blob_bytes(root: &Path, rev: &str, path: &str, limit: u64) -> Result<(V
             if size.trim().parse::<u64>().unwrap_or(u64::MAX) > limit {
                 return Err(AppError::invalid_arg("el archivo supera el límite de tamaño"));
             }
-            Ok((executor::read_bytes(root, &["show", &spec]).await?, rel))
+            Ok((executor::read_bytes(root, &["show", "--no-textconv", &spec]).await?, rel))
         }
     }
 }
@@ -975,6 +1009,51 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
 
+/// Carpetas (en cualquier nivel de la ruta) que nunca pueden ser plantilla de commit.
+const TEMPLATE_DENY_DIRS: &[&str] = &[
+    ".git", ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".config", ".local", ".cache", ".npm", ".azure", ".gcloud", ".password-store",
+    ".mozilla", ".thunderbird", ".vscode", ".1password", "library", "appdata", "keychains",
+];
+/// Nombres de archivo sensibles (config de herramientas, credenciales, historiales, claves).
+fn template_sensitive_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    const EXACT: &[&str] = &[".npmrc", ".netrc", "_netrc", ".git-credentials", ".gitconfig", ".pypirc", ".yarnrc", ".bashrc", ".zshrc", ".profile", ".zprofile", "credentials", "config", "hosts.yml", "known_hosts", "authorized_keys"];
+    EXACT.contains(&n.as_str())
+        || n.contains("history")
+        || n.contains("secret")
+        || n.contains("token")
+        || n.contains("passw")
+        || n.starts_with(".env")
+        || n.starts_with("id_")
+        || [".pem", ".key", ".p12", ".pfx", ".kdbx", ".keystore", ".jks"].iter().any(|e| n.ends_with(e))
+}
+
+/// Política de `commit.template` (auditoría M-04). `canon` y `repo` canonizados.
+/// - Dentro del repo: cualquier archivo salvo `.git/` y nombres sensibles.
+/// - Fuera del repo: solo dentro de HOME, sin carpetas sensibles ni nombres sensibles, y solo
+///   plantillas reconocibles (`.gitmessage*`, `*.txt`, `*.md`, `*.tmpl`, `*.template`, `*.gitmessage`).
+fn template_allowed(canon: &Path, repo: &Path, home: Option<&Path>) -> bool {
+    let name = canon.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if template_sensitive_name(name) {
+        return false;
+    }
+    let rel_denied = |base: &Path| {
+        canon.strip_prefix(base).map(|r| r.components().any(|c| c.as_os_str().to_str().is_some_and(|s| TEMPLATE_DENY_DIRS.contains(&s.to_ascii_lowercase().as_str())))).unwrap_or(true)
+    };
+    if canon.starts_with(repo) {
+        // En el repo solo `.git` está vedado (la carpeta de trabajo puede llamarse como sea).
+        return !canon.strip_prefix(repo).map(|r| r.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git"))).unwrap_or(true);
+    }
+    let Some(home) = home else { return false };
+    if !canon.starts_with(home) || rel_denied(home) {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with(".gitmessage")
+        || lower.starts_with(".git-commit-template")
+        || [".txt", ".md", ".tmpl", ".template", ".gitmessage"].iter().any(|e| lower.ends_with(e))
+}
+
 /// Plantilla de commit (`commit.template`) dividida en resumen y descripción.
 #[tauri::command]
 pub async fn get_commit_template(repo_path: String) -> Result<Option<CommitTemplate>> {
@@ -989,10 +1068,8 @@ pub async fn get_commit_template(repo_path: String) -> Result<Option<CommitTempl
     let path = PathBuf::from(p);
     let path = if path.is_absolute() { path } else { r.join(path) };
     let Ok(canon) = std::fs::canonicalize(&path) else { return Ok(None) };
-    let in_home = home_dir().and_then(|h| std::fs::canonicalize(h).ok()).is_some_and(|h| canon.starts_with(&h));
-    let sensitive = canon.components().any(|c| matches!(c.as_os_str().to_str(), Some(".ssh" | ".gnupg" | ".aws" | ".kube" | ".docker")));
-    if !(canon.starts_with(&r) || in_home) || sensitive {
-        return Err(AppError::invalid_path("la plantilla de commit debe estar en el repo o en tu carpeta personal"));
+    if !template_allowed(&canon, &r, home_dir().and_then(|h| std::fs::canonicalize(h).ok()).as_deref()) {
+        return Err(AppError::invalid_path("la plantilla de commit debe ser un archivo de texto del repo o una plantilla conocida de tu carpeta personal"));
     }
     let meta = tokio::fs::metadata(&canon).await?;
     if !meta.is_file() || meta.len() > 64 * 1024 {
@@ -1109,6 +1186,9 @@ pub async fn reveal_in_file_manager(repo_path: String, path: Option<String>) -> 
     if cfg!(target_os = "macos") {
         if is_file {
             executor::spawn_detached("open", &["-R", &t], None, false)
+        } else if target != r {
+            // `open <carpeta>.app` ejecutaría la aplicación: dentro del repo solo se revela (-R).
+            executor::spawn_detached("open", &["-R", &t], None, false)
         } else {
             executor::spawn_detached("open", &[&t], None, false)
         }
@@ -1148,6 +1228,11 @@ pub async fn open_in_editor(repo_path: String, path: String, editor: Option<Stri
             if cfg!(target_os = "macos") {
                 executor::spawn_detached("open", &["-a", app, &f], None, false)
             } else if cfg!(windows) {
+                // `.cmd` pasa por cmd.exe: una ruta del repo (controlable por un tercero) con
+                // metacaracteres de cmd no debe llegar ahí (auditoría I-01).
+                if f.chars().any(|c| matches!(c, '%' | '&' | '^' | '"' | '|' | '<' | '>' | '!')) {
+                    return Err(AppError::invalid_path("el nombre del archivo tiene caracteres que no se pueden pasar al editor"));
+                }
                 executor::spawn_detached(&format!("{cli}.cmd"), &[&f], Some(&r), false)
             } else {
                 executor::spawn_detached(cli, &[&f], Some(&r), false)
@@ -1166,22 +1251,63 @@ pub async fn open_in_editor(repo_path: String, path: String, editor: Option<Stri
     }
 }
 
-async fn tool_configured(root: &Path, key: &str) -> bool {
-    executor::read(root, &["config", "--get", key]).await.map(|s| !s.trim().is_empty()).unwrap_or(false)
+/// Herramientas de diff/merge integradas en git (`git mergetool --tool-help`).
+const BUILTIN_TOOLS: &[&str] = &[
+    "araxis", "bc", "bc3", "bc4", "codecompare", "deltawalker", "diffmerge", "diffuse", "ecmerge", "emerge", "examdiff", "guiffy", "gvimdiff",
+    "gvimdiff1", "gvimdiff2", "gvimdiff3", "kdiff3", "kompare", "meld", "nvimdiff", "nvimdiff1", "nvimdiff2", "nvimdiff3", "opendiff",
+    "p4merge", "smerge", "tkdiff", "tortoisemerge", "vimdiff", "vimdiff1", "vimdiff2", "vimdiff3", "vscode", "winmerge", "xxdiff",
+];
+
+/// Valor de config SOLO de nivel global del usuario (`~/.gitconfig`): ignora la config del repo.
+async fn global_config(root: &Path, key: &str) -> Option<String> {
+    let v = executor::read(root, &["config", "--global", "--get", key]).await.ok()?;
+    let v = v.trim_end_matches(['\n', '\r']);
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// Argumentos de `git difftool|mergetool` que no ejecutan nada definido por la config del repo
+/// (auditoría M-05). El nombre de la herramienta debe ser una integrada de git o tener `cmd`
+/// definido en la config global del usuario. `cmd`/`path` del repo se anulan con `-c` (que gana
+/// a la config local) usando los valores globales, o vacíos.
+async fn tool_args(root: &Path, kind: &str, rel: &str, staged: bool) -> Result<Vec<String>> {
+    let (cfg_key, sub) = if kind == "diff" { ("diff.tool", "difftool") } else { ("merge.tool", "mergetool") };
+    let tool = executor::read(root, &["config", "--get", cfg_key]).await.map(|s| s.trim().to_string()).unwrap_or_default();
+    if tool.is_empty() {
+        return Err(AppError::invalid_arg(format!("no hay herramienta de {kind} configurada ({cfg_key})")));
+    }
+    if !tool.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) || tool.starts_with('-') {
+        return Err(AppError::invalid_arg("nombre de herramienta no válido"));
+    }
+    let g_diff_cmd = global_config(root, &format!("difftool.{tool}.cmd")).await;
+    let g_merge_cmd = global_config(root, &format!("mergetool.{tool}.cmd")).await;
+    let trusted_cmd = if kind == "diff" { g_diff_cmd.clone().or(g_merge_cmd.clone()) } else { g_merge_cmd.clone() };
+    if !BUILTIN_TOOLS.contains(&tool.as_str()) && trusted_cmd.is_none() {
+        return Err(AppError::invalid_arg(
+            "esa herramienta solo está definida en la config del repositorio: defínela en tu ~/.gitconfig o usa una integrada (meld, vimdiff, kdiff3, opendiff...)",
+        ));
+    }
+    let mut a: Vec<String> = vec!["-c".into(), "core.fsmonitor=false".into()];
+    for (section, cmd) in [("difftool", &g_diff_cmd), ("mergetool", &g_merge_cmd)] {
+        a.push("-c".into());
+        a.push(format!("{section}.{tool}.cmd={}", cmd.clone().unwrap_or_default()));
+        let path = global_config(root, &format!("{section}.{tool}.path")).await.unwrap_or_default();
+        a.push("-c".into());
+        a.push(format!("{section}.{tool}.path={path}"));
+    }
+    a.extend([sub.to_string(), "--no-prompt".into(), format!("--tool={tool}")]);
+    if staged && kind == "diff" {
+        a.push("--staged".into());
+    }
+    a.extend(["--".into(), rel.to_string()]);
+    Ok(a)
 }
 
 #[tauri::command]
 pub async fn run_difftool(repo_path: String, path: String, staged: bool) -> Result<()> {
     let r = root(&repo_path).await?;
     let (rel, _) = rel_inside(&r, &path).await?;
-    if !tool_configured(&r, "diff.tool").await {
-        return Err(AppError::invalid_arg("no hay herramienta de diff configurada (diff.tool)"));
-    }
-    let mut a = vec!["difftool", "--no-prompt"];
-    if staged {
-        a.push("--staged");
-    }
-    a.extend(["--", &rel]);
+    let a = tool_args(&r, "diff", &rel, staged).await?;
+    let a: Vec<&str> = a.iter().map(String::as_str).collect();
     executor::spawn_detached("git", &a, Some(&r), false)
 }
 
@@ -1189,10 +1315,9 @@ pub async fn run_difftool(repo_path: String, path: String, staged: bool) -> Resu
 pub async fn run_mergetool(repo_path: String, path: String) -> Result<()> {
     let r = root(&repo_path).await?;
     let (rel, _) = rel_inside(&r, &path).await?;
-    if !tool_configured(&r, "merge.tool").await {
-        return Err(AppError::invalid_arg("no hay herramienta de merge configurada (merge.tool)"));
-    }
-    executor::spawn_detached("git", &["mergetool", "--no-prompt", "--", &rel], Some(&r), false)
+    let a = tool_args(&r, "merge", &rel, false).await?;
+    let a: Vec<&str> = a.iter().map(String::as_str).collect();
+    executor::spawn_detached("git", &a, Some(&r), false)
 }
 
 // ================================================================ registro / comparar / autores
@@ -1201,6 +1326,22 @@ pub async fn run_mergetool(repo_path: String, path: String) -> Result<()> {
 #[tauri::command]
 pub async fn get_activity_log(limit: Option<u32>) -> Result<Vec<ActivityEntry>> {
     Ok(executor::activity_log(limit.unwrap_or(200).clamp(1, 500) as usize))
+}
+
+/// Versión de git instalada y si cumple la mínima recomendada (auditoría B-04).
+#[tauri::command]
+pub async fn check_git_version() -> Result<GitVersionInfo> {
+    let o = tokio::process::Command::new("git")
+        .arg("--version")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| AppError::io(format!("no se pudo ejecutar git: {e}")))?;
+    let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let min = executor::MIN_GIT_VERSION;
+    let minimum = format!("{}.{}.{}", min.0, min.1, min.2);
+    let parsed = executor::parse_git_version(&text);
+    Ok(GitVersionInfo { version: text, minimum, ok: parsed.is_some_and(|v| v >= min) })
 }
 
 async fn check_rev(root: &Path, r: &str) -> Result<()> {
@@ -1217,7 +1358,7 @@ pub async fn compare_refs(repo_path: String, a: String, b: String) -> Result<Vec
     let r = root(&repo_path).await?;
     check_rev(&r, &a).await?;
     check_rev(&r, &b).await?;
-    let out = executor::read(&r, &["diff", "--no-color", "--no-ext-diff", "-M", &a, &b]).await?;
+    let out = executor::read(&r, &["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", &a, &b]).await?;
     let mut files = parsers::parse_diff(&out);
     for f in &mut files {
         f.hunks.clear();
@@ -1241,7 +1382,7 @@ pub async fn compare_file_diff(
     check_rev(&r, &b).await?;
     let rel = path_guard::safe_rel(&r, &path)?;
     let ctx = commands::context_arg(context_lines);
-    let mut args = vec!["diff", "--no-color", "--no-ext-diff", "-M"];
+    let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M"];
     if let Some(c) = ctx.as_deref() {
         args.push(c);
     }
@@ -1771,5 +1912,214 @@ mod tests {
         assert_eq!(c::get_status(p.clone()).await.unwrap().operation.as_deref(), Some("rebase"));
         op_skip(p.clone()).await.unwrap();
         assert!(c::get_status(p.clone()).await.unwrap().operation.is_none());
+    }
+
+    // ---------------------------------------------------------------- auditoría de seguridad
+
+    /// M-03: el snapshot de undo no escribe archivos sin seguimiento en `.git/objects`.
+    #[tokio::test]
+    async fn m03_snapshot_no_guarda_sin_seguimiento_en_git_objects() {
+        let (td, p) = init();
+        let d = td.path();
+        commit_file(&p, d, "a.txt", "uno\n", "primero").await;
+        std::fs::write(d.join(".env"), "API_KEY=SUPERSECRETO-12345\n").unwrap();
+        let blob = sh(d, &["hash-object", ".env"]).trim().to_string(); // sin -w: no escribe
+        let r = root(&p).await.unwrap();
+        let (tree, od) = worktree_tree(&r).await.unwrap();
+        // el árbol sí contiene .env (undo no pierde datos) y se lee desde el dir temporal...
+        let o = std::process::Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", &tree])
+            .env("GIT_OBJECT_DIRECTORY", od.0.path())
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", d.join(".git/objects"))
+            .current_dir(d)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&o.stdout).contains(".env"));
+        // ...pero el blob NO existe en el repo real.
+        let probe = std::process::Command::new("git").args(["cat-file", "-e", &blob]).current_dir(d).status().unwrap();
+        assert!(!probe.success(), "el contenido de .env no debe estar en .git/objects");
+    }
+
+    /// M-03: con el cambio, undo sigue sin borrar archivos sin seguimiento sensibles.
+    #[tokio::test]
+    async fn m03_undo_conserva_env_sin_seguimiento() {
+        let (td, p) = init();
+        let d = td.path();
+        commit_file(&p, d, "a.txt", "uno\n", "primero").await;
+        std::fs::write(d.join(".env"), "K=1\n").unwrap();
+        c::stage_all(p.clone()).await.unwrap();
+        undo_action(p.clone()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(d.join(".env")).unwrap(), "K=1\n");
+    }
+
+    /// M-04: commit.template no puede leer archivos ajenos al repo (ni sensibles).
+    #[tokio::test]
+    async fn m04_commit_template_fuera_del_repo_rechazada() {
+        let (td, p) = init();
+        let d = td.path();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secreto.txt");
+        std::fs::write(&secret, "token=abc\n").unwrap();
+        sh(d, &["config", "commit.template", secret.to_str().unwrap()]);
+        assert!(get_commit_template(p.clone()).await.is_err());
+        // .git/config del propio repo
+        sh(d, &["config", "commit.template", ".git/config"]);
+        assert!(get_commit_template(p.clone()).await.is_err());
+        // dentro del repo: permitido
+        std::fs::write(d.join("tpl.txt"), "feat: algo\n\ncuerpo\n").unwrap();
+        sh(d, &["config", "commit.template", "tpl.txt"]);
+        let t = get_commit_template(p.clone()).await.unwrap().unwrap();
+        assert_eq!(t.summary, "feat: algo");
+        // dentro del repo pero sensible: rechazado
+        std::fs::write(d.join(".env"), "A=1\n").unwrap();
+        sh(d, &["config", "commit.template", ".env"]);
+        assert!(get_commit_template(p.clone()).await.is_err());
+    }
+
+    #[test]
+    fn m04_politica_de_plantillas_en_home() {
+        let repo = Path::new("/work/repo");
+        let home = Path::new("/home/u");
+        assert!(template_allowed(Path::new("/home/u/.gitmessage"), repo, Some(home)));
+        assert!(template_allowed(Path::new("/home/u/docs/plantilla.txt"), repo, Some(home)));
+        for bad in [
+            "/home/u/.npmrc",
+            "/home/u/.netrc",
+            "/home/u/.git-credentials",
+            "/home/u/.zsh_history",
+            "/home/u/.config/gh/hosts.yml",
+            "/home/u/.ssh/notes.txt",
+            "/home/u/.aws/credentials",
+            "/home/u/Library/Application Support/x.txt",
+            "/home/u/.env.txt",
+            "/home/u/.gitconfig",
+            "/etc/passwd",
+        ] {
+            assert!(!template_allowed(Path::new(bad), repo, Some(home)), "{bad}");
+        }
+        assert!(!template_allowed(Path::new("/work/repo/.git/config"), repo, Some(home)));
+        assert!(!template_allowed(Path::new("/home/u/.gitmessage"), repo, None));
+    }
+
+    /// M-05: difftool/mergetool no ejecutan `cmd` definido en la config del repo.
+    #[tokio::test]
+    async fn m05_difftool_ignora_cmd_del_repo() {
+        let (td, p) = init();
+        let d = td.path();
+        commit_file(&p, d, "a.txt", "1\n", "c").await;
+        let r = root(&p).await.unwrap();
+        // herramienta inventada definida solo en el repo: rechazada
+        sh(d, &["config", "diff.tool", "evil"]);
+        sh(d, &["config", "difftool.evil.cmd", "touch /tmp/caesargit-pwn"]);
+        assert!(tool_args(&r, "diff", "a.txt", false).await.is_err());
+        assert!(run_difftool(p.clone(), "a.txt".into(), false).await.is_err());
+        // herramienta integrada con cmd malicioso en el repo: el cmd se anula con -c
+        sh(d, &["config", "diff.tool", "vimdiff"]);
+        sh(d, &["config", "difftool.vimdiff.cmd", "touch /tmp/caesargit-pwn"]);
+        sh(d, &["config", "difftool.vimdiff.path", "/tmp/evil-bin"]);
+        let a = tool_args(&r, "diff", "a.txt", false).await.unwrap();
+        assert!(a.iter().all(|x| !x.contains("caesargit-pwn") && !x.contains("evil-bin")), "{a:?}");
+        assert!(a.iter().any(|x| x.starts_with("difftool.vimdiff.cmd=")));
+        assert!(a.contains(&"--tool=vimdiff".to_string()));
+        // mergetool igual
+        sh(d, &["config", "merge.tool", "evil2"]);
+        sh(d, &["config", "mergetool.evil2.cmd", "touch /tmp/caesargit-pwn"]);
+        assert!(run_mergetool(p.clone(), "a.txt".into()).await.is_err());
+        // nombres con forma de opción
+        sh(d, &["config", "diff.tool", "--extcmd=evil"]);
+        assert!(tool_args(&r, "diff", "a.txt", false).await.is_err());
+    }
+
+    /// B-01: resolve_conflict / get_conflict no tocan `.git` (ni vía symlink).
+    #[tokio::test]
+    async fn b01_conflict_rechaza_dot_git() {
+        let (td, p) = init();
+        let d = td.path();
+        commit_file(&p, d, "a.txt", "1\n", "c").await;
+        let before = std::fs::read(d.join(".git/config")).unwrap();
+        assert!(c::resolve_conflict(p.clone(), ".git/config".into(), "[core]\n\tfsmonitor = touch x\n".into()).await.is_err());
+        assert!(c::resolve_conflict(p.clone(), ".git/hooks/pre-commit".into(), "#!/bin/sh\ntouch x\n".into()).await.is_err());
+        assert!(c::get_conflict(p.clone(), ".git/config".into()).await.is_err());
+        assert_eq!(std::fs::read(d.join(".git/config")).unwrap(), before);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(d.join(".git"), d.join("enlace")).unwrap();
+            assert!(c::resolve_conflict(p.clone(), "enlace/config".into(), "x".into()).await.is_err());
+            assert!(c::get_conflict(p.clone(), "enlace/config".into()).await.is_err());
+            assert_eq!(std::fs::read(d.join(".git/config")).unwrap(), before);
+        }
+    }
+
+    /// B-06: ningún diff/patch/blame ejecuta `diff.<drv>.textconv` definido en el repo.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn b06_textconv_no_se_ejecuta() {
+        use std::os::unix::fs::PermissionsExt;
+        let (td, p) = init();
+        let d = td.path();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("pwned");
+        let script = outside.path().join("conv.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\ncat \"$1\"\n", marker.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(d.join(".gitattributes"), "*.dat diff=ev\n").unwrap();
+        sh(d, &["config", "diff.ev.textconv", script.to_str().unwrap()]);
+        let first = commit_file(&p, d, "f.dat", "v1\n", "uno").await;
+        std::fs::write(d.join("f.dat"), "v2\n").unwrap();
+        // control: git a pelo sí lo ejecuta
+        sh(d, &["diff"]);
+        assert!(marker.exists(), "el control debe disparar textconv");
+        std::fs::remove_file(&marker).unwrap();
+
+        c::get_file_diff(p.clone(), "f.dat".into(), false, false, None, None).await.unwrap();
+        crate::git::ext_b::create_patch(p.clone(), None, Some(true)).await.unwrap();
+        crate::git::ext_b::create_patch(p.clone(), Some(vec![first.clone()]), None).await.unwrap();
+        c::blame_file(p.clone(), "f.dat".into(), None).await.unwrap();
+        c::get_commit_file_diff(p.clone(), first.clone(), "f.dat".into(), false, None, None).await.ok();
+        compare_file_diff(p.clone(), first.clone(), "HEAD".into(), "f.dat".into(), None, None, None).await.unwrap();
+        assert!(!marker.exists(), "textconv del repo se ejecutó");
+    }
+
+    /// B-03: tokens usados como usuario y contraseñas con `@` también se enmascaran.
+    #[test]
+    fn b03_enmascara_credenciales() {
+        // (entrada, secreto que no debe quedar, resultado esperado de mask_url)
+        for (input, leak, want) in [
+            ("https://ghp_SECRET123@github.com/a/b.git", "ghp_SECRET123", "https://***@github.com/a/b.git"),
+            ("https://user:pa@ss@host/x.git", "pa@ss", "https://user@host/x.git"),
+            ("https://user:pass@host/x.git", "pass", "https://user@host/x.git"),
+            ("fatal: unable to access 'https://tok_ABC@gitlab.com/x/': 403", "tok_ABC", "fatal: unable to access 'https://***@gitlab.com/x/': 403"),
+            ("HTTP://U:P@H/x", "U:P", "HTTP://U@H/x"),
+        ] {
+            assert_eq!(mask_url(input), want);
+            assert!(!executor::sanitize(Path::new("/nope/repo"), input).contains(leak), "sanitize filtra {leak}");
+        }
+        assert_eq!(mask_url("ssh://git@github.com/a/b.git"), "ssh://git@github.com/a/b.git");
+        assert_eq!(mask_url("git@github.com:a/b.git"), "git@github.com:a/b.git");
+        assert_eq!(mask_url("https://github.com/a@b/c"), "https://github.com/a@b/c");
+    }
+
+    /// B-04: parseo de versión de git y comprobación de mínima.
+    #[tokio::test]
+    async fn b04_version_de_git() {
+        assert_eq!(executor::parse_git_version("git version 2.50.1 (Apple Git-155)"), Some((2, 50, 1)));
+        assert_eq!(executor::parse_git_version("git version 2.43.0.windows.1"), Some((2, 43, 0)));
+        assert_eq!(executor::parse_git_version("git version 2.30"), Some((2, 30, 0)));
+        assert_eq!(executor::parse_git_version("nada"), None);
+        assert!(executor::parse_git_version("git version 2.39.2").unwrap() < executor::MIN_GIT_VERSION);
+        let info = check_git_version().await.unwrap();
+        assert!(info.version.starts_with("git version"));
+        assert_eq!(info.minimum, "2.45.1");
+    }
+
+    /// I-08: las variables GIT_* del proceso padre que redirigen git no se heredan.
+    #[tokio::test]
+    async fn i08_entorno_de_git_limpio() {
+        let (_td, p) = init();
+        let r = root(&p).await.unwrap();
+        std::env::set_var("GIT_PAGER", "pager-malicioso");
+        let out = executor::read(&r, &["var", "GIT_PAGER"]).await;
+        std::env::remove_var("GIT_PAGER");
+        assert!(!out.unwrap().contains("pager-malicioso"));
     }
 }

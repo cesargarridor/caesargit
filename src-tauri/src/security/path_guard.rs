@@ -57,14 +57,24 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(result)
 }
 
+/// Rechaza cualquier ruta con un componente `.git` (hooks, config...), sin distinguir mayúsculas.
+pub fn reject_dot_git(rel: &Path) -> Result<()> {
+    if rel.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")) {
+        return Err(AppError::invalid_path("no se permite acceder a .git"));
+    }
+    Ok(())
+}
+
 /// Valida `rel` con `safe_join` y devuelve la ruta relativa a `root` con `/`,
-/// lista para ir tras `--` en un comando git.
+/// lista para ir tras `--` en un comando git. Rechaza `.git` (también si llega resuelto
+/// a través de un symlink del repo, porque `safe_join` ya resolvió los enlaces).
 pub fn safe_rel(root: &Path, rel: &str) -> Result<String> {
     let full = safe_join(root, rel)?;
     let r = full.strip_prefix(root).map_err(|_| AppError::invalid_path("la ruta queda fuera del repositorio"))?;
     if r.as_os_str().is_empty() {
         return Err(AppError::invalid_path("la ruta es la raíz del repositorio"));
     }
+    reject_dot_git(r)?;
     Ok(r.to_string_lossy().replace('\\', "/"))
 }
 
@@ -124,6 +134,28 @@ mod tests {
         std::os::unix::fs::symlink(&other, r.join("link")).unwrap();
         assert!(safe_join(&r, "link/secret").is_err());
         assert!(safe_join(&r, "link").is_err());
+    }
+
+    #[test]
+    fn dot_git_rejected_in_safe_rel() {
+        let (_d, r) = root();
+        std::fs::create_dir_all(r.join(".git/hooks")).unwrap();
+        std::fs::write(r.join(".git/config"), "x").unwrap();
+        assert!(safe_rel(&r, ".git/config").is_err());
+        assert!(safe_rel(&r, ".git/hooks/pre-commit").is_err());
+        assert!(safe_rel(&r, ".GIT/config").is_err());
+        assert!(safe_rel(&r, "sub/.git/x").is_err());
+        assert!(safe_rel(&r, ".gitignore").is_ok());
+        assert!(safe_rel(&r, "a.git/x").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_dot_git_rejected() {
+        let (_d, r) = root();
+        std::fs::create_dir_all(r.join(".git/hooks")).unwrap();
+        std::os::unix::fs::symlink(r.join(".git"), r.join("innocent")).unwrap();
+        assert!(safe_rel(&r, "innocent/hooks/pre-commit").is_err());
     }
 
     #[test]

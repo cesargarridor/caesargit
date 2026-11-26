@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-toggle-hook"
+description = "Enables the toggle_hook command without any pre-configured scope."
+commands.allow = ["toggle_hook"]
+
+[[permission]]
+identifier = "deny-toggle-hook"
+description = "Denies the toggle_hook command without any pre-configured scope."
+commands.deny = ["toggle_hook"]

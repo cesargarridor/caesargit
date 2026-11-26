@@ -292,3 +292,12 @@ pub struct InitTemplates {
     pub gitignore: Vec<String>,
     pub licenses: Vec<String>,
 }
+
+/// Resultado de `check_git_version`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitVersionInfo {
+    pub version: String,
+    pub minimum: String,
+    pub ok: bool,
+}

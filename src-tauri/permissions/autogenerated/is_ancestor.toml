@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-is-ancestor"
+description = "Enables the is_ancestor command without any pre-configured scope."
+commands.allow = ["is_ancestor"]
+
+[[permission]]
+identifier = "deny-is-ancestor"
+description = "Denies the is_ancestor command without any pre-configured scope."
+commands.deny = ["is_ancestor"]

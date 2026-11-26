@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-submodule-sync"
+description = "Enables the submodule_sync command without any pre-configured scope."
+commands.allow = ["submodule_sync"]
+
+[[permission]]
+identifier = "deny-submodule-sync"
+description = "Denies the submodule_sync command without any pre-configured scope."
+commands.deny = ["submodule_sync"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-activity-log"
+description = "Enables the get_activity_log command without any pre-configured scope."
+commands.allow = ["get_activity_log"]
+
+[[permission]]
+identifier = "deny-get-activity-log"
+description = "Denies the get_activity_log command without any pre-configured scope."
+commands.deny = ["get_activity_log"]

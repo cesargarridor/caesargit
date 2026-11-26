@@ -229,22 +229,22 @@ export default function App() {
       {showMain && <BisectBanner />}
       <div className="min-h-0 flex-1">
         {!showMain ? <NewTabView /> : (
-          <PanelGroup direction="horizontal" autoSaveId="caesargit-main" key={`${showLeft}-${showRight}`}>
+          <PanelGroup direction="horizontal" autoSaveId="caesargit-main-v2" key={`${showLeft}-${showRight}`}>
             {showLeft && (
               <>
-                <Panel id="left" order={1} defaultSize={18} minSize={12} maxSize={35} className="bg-panel">
+                <Panel id="left" order={1} defaultSize={15} minSize={10} maxSize={35} className="bg-panel">
                   <div data-pane="sidebar" tabIndex={-1} className="h-full outline-none"><Sidebar /></div>
                 </Panel>
                 <PanelResizeHandle className={handleV} />
               </>
             )}
-            <Panel id="center" order={2} defaultSize={52} minSize={30} className="relative">
+            <Panel id="center" order={2} defaultSize={57} minSize={30} className="relative">
               <CommitGraph />
             </Panel>
             {showRight && (
               <>
                 <PanelResizeHandle className={handleV} />
-                <Panel id="right" order={3} defaultSize={30} minSize={20} maxSize={55} className="bg-panel">
+                <Panel id="right" order={3} defaultSize={28} minSize={18} maxSize={55} className="bg-panel">
                   <div data-pane="inspector" tabIndex={-1} className="h-full outline-none"><Inspector /></div>
                 </Panel>
               </>

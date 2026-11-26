@@ -117,7 +117,7 @@ pub(crate) async fn worktree_diff(root: &Path, rel: &str, staged: bool, ignore_w
         }
     }
     let ctx = context_arg(context);
-    let mut a = vec!["diff", "--no-color", "--no-ext-diff", "-M"];
+    let mut a = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M"];
     if let Some(c) = ctx.as_deref() {
         a.push(c);
     }
@@ -740,7 +740,7 @@ async fn discard_rels(root: &Path, rs: &[String]) -> Result<()> {
         match file_change(root, rel).await? {
             Some(fc) if fc.conflicted => {}
             Some(fc) if fc.worktree == '?' => {
-                executor::write(root, &["clean", "-f", "-d", "--", rel]).await?;
+                executor::write_env(root, &["clean", "-f", "-d", "--", rel], &[("GIT_LITERAL_PATHSPECS", "1")]).await?;
             }
             Some(fc) if fc.unstaged => tracked.push(rel),
             _ => {}
@@ -749,7 +749,8 @@ async fn discard_rels(root: &Path, rs: &[String]) -> Result<()> {
     if !tracked.is_empty() {
         let mut a = vec!["restore", "--worktree", "--"];
         a.extend(tracked);
-        executor::write(root, &a).await?;
+        // Nombres como `:(glob)**` o `[id].tsx` se tratan literalmente: no pueden descartar más de lo elegido.
+        executor::write_env(root, &a, &[("GIT_LITERAL_PATHSPECS", "1")]).await?;
     }
     Ok(())
 }
@@ -826,7 +827,7 @@ pub async fn get_file_diff(
 pub async fn get_commit_files(repo_path: String, sha: String) -> Result<Vec<DiffFile>> {
     let r = root(&repo_path).await?;
     validate_sha(&sha)?;
-    let out = executor::read(&r, &["show", "--no-color", "--no-ext-diff", "--format=", "-M", "--first-parent", "-m", &sha]).await?;
+    let out = executor::read(&r, &["show", "--no-color", "--no-ext-diff", "--no-textconv", "--format=", "-M", "--first-parent", "-m", &sha]).await?;
     let mut files = parsers::parse_diff(&out);
     for f in &mut files {
         f.hunks.clear();
@@ -847,7 +848,7 @@ pub async fn get_commit_file_diff(
     validate_sha(&sha)?;
     let rel = path_guard::safe_rel(&r, &path)?;
     let ctx = context_arg(context_lines);
-    let mut a = vec!["show", "--no-color", "--no-ext-diff", "--format=", "-M", "--first-parent", "-m"];
+    let mut a = vec!["show", "--no-color", "--no-ext-diff", "--no-textconv", "--format=", "-M", "--first-parent", "-m"];
     if let Some(c) = ctx.as_deref() {
         a.push(c);
     }
@@ -1302,7 +1303,7 @@ pub async fn get_conflict(repo_path: String, path: String) -> Result<ConflictFil
     let stage = |n: u8| format!(":{n}:{rel}");
     let show = |spec: String| {
         let r = r.clone();
-        async move { executor::read_bytes(&r, &["show", &spec]).await.map(|b| String::from_utf8_lossy(&b).into_owned()) }
+        async move { executor::read_bytes(&r, &["show", "--no-textconv", &spec]).await.map(|b| String::from_utf8_lossy(&b).into_owned()) }
     };
     let ours = show(stage(2)).await.unwrap_or_default();
     let theirs = show(stage(3)).await.unwrap_or_default();
@@ -1332,7 +1333,7 @@ pub async fn resolve_conflict(repo_path: String, path: String, content: String) 
 pub async fn blame_file(repo_path: String, path: String, rev: Option<String>) -> Result<Vec<BlameLine>> {
     let r = root(&repo_path).await?;
     let rel = path_guard::safe_rel(&r, &path)?;
-    let mut a: Vec<&str> = vec!["blame", "--porcelain"];
+    let mut a: Vec<&str> = vec!["blame", "--porcelain", "--no-textconv"];
     if let Some(v) = rev.as_deref().filter(|v| !v.is_empty()) {
         validate_ref(v)?;
         a.push(v);

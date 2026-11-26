@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fast-forward-branch"
+description = "Enables the fast_forward_branch command without any pre-configured scope."
+commands.allow = ["fast_forward_branch"]
+
+[[permission]]
+identifier = "deny-fast-forward-branch"
+description = "Denies the fast_forward_branch command without any pre-configured scope."
+commands.deny = ["fast_forward_branch"]

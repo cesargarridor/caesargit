@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-checkout-remote-branch"
+description = "Enables the checkout_remote_branch command without any pre-configured scope."
+commands.allow = ["checkout_remote_branch"]
+
+[[permission]]
+identifier = "deny-checkout-remote-branch"
+description = "Denies the checkout_remote_branch command without any pre-configured scope."
+commands.deny = ["checkout_remote_branch"]
